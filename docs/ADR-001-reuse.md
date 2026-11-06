@@ -183,6 +183,10 @@ aktywację wersji przywróconej przez rollback.
 
 ## Otwarte punkty P0
 
+0. Zacommitować i opublikować w BALD zmianę `bse-fetch`, która egzekwuje
+   allowlistę hostów na każdym redirect hopie, a następnie zastąpić tymczasowy
+   `path` dependency przypiętym `git` revision. Bez tego niezależny build
+   V.I.C.T.O.R. nie jest jeszcze reprodukowalny.
 1. Pisemna zgoda na JFP Box v0.2 (PolyForm NC) albo zastąpienie go własnym
    walidatorem manifestu.
 2. Decyzja: `viper-boxd` czy Rust Lab jako jedyny backend izolacji.

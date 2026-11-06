@@ -176,6 +176,13 @@ cargo fmt --all --check
 
 ## Czego jeszcze nie ma
 
+- Niezależnego, przypiętego commita `bse-fetch` w repozytorium BALD. Obecny
+  adapter wymaga `allowed_hosts` egzekwowanego na każdym redirect hopie; ta
+  zmiana istnieje obecnie tylko w niezacommitowanym checkoutcie BALD. Do czasu
+  zatwierdzenia jej upstream nie zamieniamy jej na słabszą walidację URL-u
+  początkowego.
+- Czystego buildu V.I.C.T.O.R. bez checkoutu BALD obok workspace — pozostaje
+  to jedynym aktywnym blockerem integracyjnym.
 - Indeksu semantycznego i `apps/`.
 - Migracji schematu SQLite poza pierwszą migracją bazową — obecny storage ma
   trwały schemat kontekstu i audytu oraz odtwarzanie po restarcie.
