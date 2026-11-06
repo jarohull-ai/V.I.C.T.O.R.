@@ -1,0 +1,18 @@
+[package]
+name = "victor-fetch-bald"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bse-fetch = { path = "../../../../../BALD SEARCH ENGINE/crates/bse-fetch" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+victor-domain = { path = "../victor-domain" }
+victor-tools = { path = "../victor-tools" }
+
+[dev-dependencies]
+tokio.workspace = true

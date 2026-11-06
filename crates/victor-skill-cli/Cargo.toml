@@ -1,0 +1,15 @@
+[package]
+name = "victor-skill-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "victor-skill"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+victor-skill-forge = { path = "../victor-skill-forge" }
+victor-skill-transport = { path = "../victor-skill-transport" }
+victor-skills = { path = "../victor-skills" }

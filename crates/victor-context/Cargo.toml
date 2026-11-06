@@ -1,0 +1,11 @@
+[package]
+name = "victor-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+victor-domain = { path = "../victor-domain" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

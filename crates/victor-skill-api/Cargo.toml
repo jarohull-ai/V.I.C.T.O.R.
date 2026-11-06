@@ -1,0 +1,19 @@
+[package]
+name = "victor-skill-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+victor-domain = { path = "../victor-domain" }
+victor-policy = { path = "../victor-policy" }
+victor-skill-forge = { path = "../victor-skill-forge" }
+victor-skills = { path = "../victor-skills" }
+victor-tools = { path = "../victor-tools" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+victor-storage = { path = "../victor-storage" }

@@ -1,0 +1,21 @@
+[package]
+name = "victor-skill-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+victor-skill-api = { path = "../victor-skill-api" }
+victor-skill-forge = { path = "../victor-skill-forge" }
+victor-skills = { path = "../victor-skills" }
+
+[dev-dependencies]
+tempfile.workspace = true
+victor-domain = { path = "../victor-domain" }
+victor-policy = { path = "../victor-policy" }
+victor-storage = { path = "../victor-storage" }
+victor-tools = { path = "../victor-tools" }

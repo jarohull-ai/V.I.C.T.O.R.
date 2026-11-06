@@ -1,0 +1,27 @@
+[package]
+name = "victor-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+victor-domain = { path = "../victor-domain" }
+victor-policy = { path = "../victor-policy" }
+victor-integrations = { path = "../victor-integrations" }
+victor-context = { path = "../victor-context" }
+victor-tools = { path = "../victor-tools" }
+# Celowo `default-features = false`: runtime zna kontrakt chmurowy i typ zgody,
+# ale nie wciąga klienta HTTP. OpenAI/Deepgram włącza dopiero aplikacja hostująca.
+victor-stt-cloud = { path = "../victor-stt-cloud", default-features = false }
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+victor-fetch-bald = { path = "../victor-fetch-bald" }
+victor-skills = { path = "../victor-skills" }
+victor-storage = { path = "../victor-storage" }

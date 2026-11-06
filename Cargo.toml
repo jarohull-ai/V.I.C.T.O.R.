@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/victor-domain",
+    "crates/victor-policy",
+    "crates/victor-integrations",
+    "crates/victor-context",
+    "crates/victor-tools",
+    "crates/victor-fetch-bald",
+    "crates/victor-storage",
+    "crates/victor-skills",
+    "crates/victor-skill-forge",
+    "crates/victor-skill-api",
+    "crates/victor-skill-transport",
+    "crates/victor-skill-cli",
+    "crates/victor-stt-cloud",
+    "crates/victor-runtime",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+async-trait = "0.1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+url = "2"
