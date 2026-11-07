@@ -220,7 +220,11 @@ impl ConversationModel for DeterministicTestModel {
                 args: serde_json::json!({"path": path, "max_bytes": 64 * 1024}),
             });
         }
-        if input.to_ascii_lowercase().contains("plugin_sysinfo") {
+        let normalized = input.to_ascii_lowercase();
+        if normalized.contains("plugin_sysinfo")
+            || (normalized.contains("status") && normalized.contains("system"))
+            || normalized.contains("stan systemu")
+        {
             Ok(ModelResult::PlanRequest {
                 tool: ToolId::parse("plugin_sysinfo").map_err(|e| e.to_string())?,
                 description: "Odczytaj lokalne CPU i RAM".into(),
@@ -493,6 +497,17 @@ mod tests {
         let model = DeterministicTestModel;
         let result = model.respond(session.turns(), "hej").await.unwrap();
         assert!(matches!(result, ModelResult::Reply(_)));
+    }
+
+    #[tokio::test]
+    async fn local_model_routes_system_status_to_sysinfo_plan() {
+        let model = DeterministicTestModel;
+        let result = model.respond(&[], "pokaż status systemu").await.unwrap();
+        assert!(matches!(
+            result,
+            ModelResult::PlanRequest { tool, args, .. }
+                if tool == ToolId::parse("plugin_sysinfo").unwrap() && args == serde_json::json!({})
+        ));
     }
 
     #[test]
