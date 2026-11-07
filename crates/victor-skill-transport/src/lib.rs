@@ -759,16 +759,18 @@ mod tests {
         let server = UnixSkillServer::new(&path, "0123456789abcdef", "default", api()).unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let server_task = tokio::spawn(server.run(shutdown_rx));
-        for _ in 0..20 {
-            if path.exists() {
+        let mut private = false;
+        for _ in 0..200 {
+            if std::fs::metadata(&path)
+                .ok()
+                .is_some_and(|meta| meta.permissions().mode() & 0o777 == 0o600)
+            {
+                private = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert!(private);
         let mut bad = request();
         bad.token = "wrong-token-123456".into();
         assert!(!roundtrip(&path, bad).await.ok);
