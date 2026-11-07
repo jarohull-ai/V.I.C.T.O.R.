@@ -20,6 +20,7 @@ members = [
     "crates/victor-daemon",
     "crates/victor-conversation",
     "crates/victor-model-local",
+    "crates/victor-tts-local",
 ]
 
 [workspace.package]

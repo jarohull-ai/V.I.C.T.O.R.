@@ -160,7 +160,11 @@ cargo fmt --all --check
     określa binarkę whisper.cpp, model, limity, środowisko i sandbox; klient
     wysyła tylko audio oraz conversation ID. Audio nie trafia do SQLite, a
     transcript przechodzi przez runtime, rozmowę, policy i narzędzia.
-18. **Chmura to osobny crate i opt-in.** `victor-stt-cloud` ma `default = []`;
+18. **Lokalny TTS jest opcjonalnym adapterem odpowiedzi.** Trusted
+    `local-tts.json` uruchamia wyłącznie lokalny proces, a tekst odpowiedzi
+    pozostaje dostępny także przy wyłączonym lub błędnym TTS. Audio nie jest
+    zapisywane w SQLite bez jawnej retencji.
+19. **Chmura to osobny crate i opt-in.** `victor-stt-cloud` ma `default = []`;
     dopiero `--features openai` albo `--features deepgram` wciąga klienta HTTP.
     `victor-integrations` i lokalna ścieżka whisper.cpp nie wiedzą o istnieniu
     chmury, a `victor-stt-cloud` nie zna whispera.

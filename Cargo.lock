@@ -1913,6 +1913,7 @@ dependencies = [
  "victor-skill-transport",
  "victor-storage",
  "victor-tools",
+ "victor-tts-local",
 ]
 
 [[package]]
@@ -2152,6 +2153,19 @@ dependencies = [
  "tokio",
  "victor-context",
  "victor-domain",
+]
+
+[[package]]
+name = "victor-tts-local"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "victor-integrations",
 ]
 
 [[package]]

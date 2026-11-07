@@ -25,6 +25,7 @@ victor-runtime = { path = "../victor-runtime" }
 victor-model-local = { path = "../victor-model-local" }
 victor-integrations = { path = "../victor-integrations" }
 victor-context = { path = "../victor-context" }
+victor-tts-local = { path = "../victor-tts-local" }
 
 [dev-dependencies]
 tempfile.workspace = true

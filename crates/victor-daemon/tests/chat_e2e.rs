@@ -11,9 +11,11 @@ use tokio::sync::oneshot;
 use victor_context::{ContextContent, ContextScope, ContextStore};
 use victor_daemon::{
     Daemon, DaemonConfig, TrustedLocalModelDefinition, TrustedLocalModelSpec,
-    TrustedLocalSttDefinition, TrustedPluginDefinition,
+    TrustedLocalSttDefinition, TrustedLocalTtsDefinition, TrustedLocalTtsSpec,
+    TrustedPluginDefinition,
 };
 use victor_domain::{RiskLevel, ToolDescriptor, ToolId};
+use victor_integrations::AudioFormat;
 use victor_plugin_host::{PluginLaunchRequest, SandboxRequirement};
 use victor_storage::SqliteContextStore;
 use victor_tools::ToolManifest;
@@ -47,13 +49,16 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
     let fixture_model = std::path::PathBuf::from(env!("CARGO_BIN_EXE_daemon_model_fixture"));
     let fixture_stt = std::path::PathBuf::from(env!("CARGO_BIN_EXE_daemon_stt_fixture"));
     let fixture_plugin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_daemon_plugin_fixture"));
+    let fixture_tts = std::path::PathBuf::from(env!("CARGO_BIN_EXE_daemon_tts_fixture"));
     let model_bin = root.path().join("model-fixture");
     let stt_bin = root.path().join("stt-fixture");
     let plugin_bin = root.path().join("plugin-fixture");
+    let tts_bin = root.path().join("tts-fixture");
     for (source, target) in [
         (&fixture_model, &model_bin),
         (&fixture_stt, &stt_bin),
         (&fixture_plugin, &plugin_bin),
+        (&fixture_tts, &tts_bin),
     ] {
         std::fs::copy(source, target).unwrap();
         std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -150,6 +155,34 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
         &defs.join("local-stt.json"),
         &serde_json::to_vec(&stt).unwrap(),
     );
+    let tts_spec = TrustedLocalTtsSpec {
+        command: vec![tts_bin.display().to_string()],
+        voice: "fixture".into(),
+        model: tts_bin.display().to_string(),
+        language: "pl".into(),
+        output_format: AudioFormat::Wav,
+        min_speed: 0.5,
+        max_speed: 2.0,
+        working_dir: root.path().display().to_string(),
+        environment: BTreeMap::new(),
+        timeout_ms: 1000,
+        max_frame_bytes: 64 * 1024,
+        max_audio_bytes: 1024,
+        max_stderr_bytes: 4096,
+        max_restart_attempts: 1,
+        sandbox_required: false,
+        sandbox_executable: None,
+        executable_sha256: hash(&std::fs::read(&tts_bin).unwrap()),
+        model_sha256: hash(&std::fs::read(&tts_bin).unwrap()),
+    };
+    let tts = TrustedLocalTtsDefinition {
+        config_sha256: hash(&serde_json::to_vec(&tts_spec).unwrap()),
+        spec: tts_spec,
+    };
+    private_file(
+        &defs.join("local-tts.json"),
+        &serde_json::to_vec(&tts).unwrap(),
+    );
     let token_path = root.path().join("token");
     private_file(&token_path, b"0123456789abcdef");
     let sqlite_path = root.path().join("state.sqlite");
@@ -163,6 +196,7 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
         scope: "local".into(),
         local_model_definition: root.path().join("defs/model.conf"),
         local_stt_definition: root.path().join("defs/local-stt.json"),
+        local_tts_definition: Some(root.path().join("defs/local-tts.json")),
     };
     let daemon = Daemon::prepare(config).await.unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -222,6 +256,7 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
     assert_eq!(response["result"]["provider"], "whisper.cpp");
     assert_eq!(response["result"]["location"], "local");
     assert_eq!(response["result"]["transcript"], "pokaż status systemu");
+    assert_eq!(response["result"]["tts"]["status"], "synthesized");
     let _ = shutdown_tx.send(());
     assert!(task.await.unwrap().is_ok());
     let store = SqliteContextStore::open(&sqlite_path).unwrap();

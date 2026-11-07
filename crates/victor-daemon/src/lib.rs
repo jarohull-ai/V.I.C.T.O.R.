@@ -16,7 +16,9 @@ use victor_conversation::{
     ConversationEngine, ConversationLimits, ConversationRouter, ConversationService,
 };
 use victor_domain::ToolId;
-use victor_integrations::{WhisperCppConfig, WhisperCppSpeechToText};
+use victor_integrations::{
+    AudioFormat, SpeechOutput, SpeechRequest, WhisperCppConfig, WhisperCppSpeechToText,
+};
 use victor_model_local::{LocalModel, LocalModelConfig};
 use victor_plugin_host::{PluginLaunchPolicy, PluginLaunchRequest, PluginLifecycleApi};
 use victor_policy::{PolicyConfig, PolicyEngine};
@@ -25,6 +27,7 @@ use victor_skill_api::SkillApi;
 use victor_skill_transport::{UnixSkillServer, VoiceService};
 use victor_storage::SqliteContextStore;
 use victor_tools::{ToolManifest, ToolRegistry};
+use victor_tts_local::{LocalTts, LocalTtsConfig};
 
 const DEFAULT_SCOPE: &str = "local";
 
@@ -59,6 +62,7 @@ pub struct DaemonConfig {
     pub scope: String,
     pub local_model_definition: PathBuf,
     pub local_stt_definition: PathBuf,
+    pub local_tts_definition: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -151,9 +155,39 @@ pub struct TrustedLocalSttDefinition {
     pub spec: TrustedLocalSttSpec,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedLocalTtsSpec {
+    pub command: Vec<String>,
+    pub voice: String,
+    pub model: String,
+    pub language: String,
+    pub output_format: AudioFormat,
+    pub min_speed: f32,
+    pub max_speed: f32,
+    pub working_dir: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_audio_bytes: usize,
+    pub max_stderr_bytes: usize,
+    pub max_restart_attempts: u32,
+    pub sandbox_required: bool,
+    pub sandbox_executable: Option<String>,
+    pub executable_sha256: String,
+    pub model_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedLocalTtsDefinition {
+    pub config_sha256: String,
+    pub spec: TrustedLocalTtsSpec,
+}
+
 struct DaemonVoiceService {
     stt: SttRuntime<WhisperCppSpeechToText>,
     conversation: Arc<dyn ConversationService>,
+    tts: Option<Arc<LocalTts>>,
 }
 
 #[async_trait]
@@ -198,12 +232,37 @@ impl VoiceService for DaemonVoiceService {
             )
             .await
             .map_err(|e| e.to_string())?;
+        let response_text = match &reply {
+            victor_conversation::ConversationOutcome::Reply { text }
+            | victor_conversation::ConversationOutcome::Executed { text, .. }
+            | victor_conversation::ConversationOutcome::ApprovalRequired { text, .. }
+            | victor_conversation::ConversationOutcome::Denied { text, .. } => text,
+        };
+        let tts = if let Some(tts) = &self.tts {
+            match tts
+                .synthesize(SpeechRequest::new(response_text, "pl"))
+                .await
+            {
+                Ok(audio) => serde_json::json!({
+                    "status": "synthesized", "provider": tts.provider(),
+                    "format": audio.format, "sample_rate_hz": audio.sample_rate_hz,
+                    "cache_key": audio.cache_key, "bytes": audio.bytes
+                }),
+                Err(error) => serde_json::json!({
+                    "status": "error", "provider": tts.provider(), "error": error.to_string()
+                }),
+            }
+        } else {
+            serde_json::json!({"status": "disabled"})
+        };
         Ok(serde_json::json!({
             "transcript": outcome.transcript.text,
             "provider": outcome.transcript.provider,
             "location": outcome.transcript.location,
             "audio_sha256": audio_hash,
-            "conversation": reply
+            "conversation": reply,
+            "text": response_text,
+            "tts": tts
         }))
     }
 }
@@ -227,6 +286,11 @@ impl Daemon {
         let definitions = load_definitions(&config.trusted_definitions_dir)?;
         let model_definition = load_local_model_definition(&config)?;
         let stt_definition = load_local_stt_definition(&config)?;
+        let tts_definition = config
+            .local_tts_definition
+            .as_ref()
+            .map(|_| load_local_tts_definition(&config))
+            .transpose()?;
 
         let store = Arc::new(
             SqliteContextStore::open(&config.sqlite_path)
@@ -332,6 +396,14 @@ impl Daemon {
         let voice = Arc::new(DaemonVoiceService {
             stt,
             conversation: conversation.clone(),
+            tts: tts_definition
+                .as_ref()
+                .map(tts_definition_to_config)
+                .transpose()?
+                .map(LocalTts::new)
+                .transpose()
+                .map_err(|e| DaemonError::Config(e.to_string()))?
+                .map(Arc::new),
         });
         let server = UnixSkillServer::new(&config.socket_path, token, &config.scope, skill_api)
             .map_err(|e| DaemonError::Transport(e.to_string()))?
@@ -496,7 +568,7 @@ fn load_definitions(dir: &Path) -> Result<Vec<TrustedPluginDefinition>, DaemonEr
         let path = entry.path();
         if matches!(
             path.file_name().and_then(|name| name.to_str()),
-            Some("local-model.json" | "local-stt.json")
+            Some("local-model.json" | "local-stt.json" | "local-tts.json")
         ) {
             continue;
         }
@@ -676,6 +748,79 @@ fn load_local_stt_definition(
     Ok(definition)
 }
 
+fn load_local_tts_definition(
+    config: &DaemonConfig,
+) -> Result<TrustedLocalTtsDefinition, DaemonError> {
+    let path = config
+        .local_tts_definition
+        .as_ref()
+        .ok_or_else(|| DaemonError::Config("lokalny TTS nie jest skonfigurowany".into()))?;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.uid() != uid()
+        || meta.permissions().mode() & 0o022 != 0
+        || path.parent() != Some(config.trusted_definitions_dir.as_path())
+    {
+        return Err(DaemonError::Config(
+            "niebezpieczna definicja lokalnego TTS".into(),
+        ));
+    }
+    let definition: TrustedLocalTtsDefinition = serde_json::from_reader(File::open(path)?)?;
+    if hash_bytes(&serde_json::to_vec(&definition.spec)?) != definition.config_sha256 {
+        return Err(DaemonError::Config(
+            "hash trusted config lokalnego TTS nie pasuje".into(),
+        ));
+    }
+    let executable = definition
+        .spec
+        .command
+        .first()
+        .map(Path::new)
+        .ok_or_else(|| DaemonError::Config("brak executable lokalnego TTS".into()))?;
+    let model = Path::new(&definition.spec.model);
+    let working_dir = Path::new(&definition.spec.working_dir);
+    if !executable.is_absolute()
+        || !model.is_absolute()
+        || !working_dir.is_absolute()
+        || !safe_owned_file(executable)
+        || !safe_owned_file(model)
+        || !safe_owned_directory(working_dir)
+        || hash_file(executable)? != definition.spec.executable_sha256
+        || hash_file(model)? != definition.spec.model_sha256
+        || definition.spec.timeout_ms == 0
+        || definition.spec.max_frame_bytes < 128
+        || definition.spec.max_audio_bytes == 0
+        || definition.spec.max_stderr_bytes == 0
+    {
+        return Err(DaemonError::Config(
+            "niebezpieczna konfiguracja lokalnego TTS".into(),
+        ));
+    }
+    if definition.spec.environment.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        ["secret", "token", "password", "api_key", "private_key"]
+            .iter()
+            .any(|marker| key.contains(marker))
+    }) {
+        return Err(DaemonError::Config(
+            "środowisko lokalnego TTS zawiera nazwę sekretu".into(),
+        ));
+    }
+    if definition.spec.sandbox_required {
+        let sandbox = definition
+            .spec
+            .sandbox_executable
+            .as_deref()
+            .map(Path::new)
+            .ok_or_else(|| DaemonError::Config("TTS wymaga sandbox executable".into()))?;
+        if !sandbox.is_absolute() || !safe_owned_file(sandbox) {
+            return Err(DaemonError::Config("niebezpieczny sandbox TTS".into()));
+        }
+    }
+    Ok(definition)
+}
+
 fn stt_definition_to_config(
     definition: &TrustedLocalSttDefinition,
 ) -> Result<WhisperCppConfig, DaemonError> {
@@ -695,6 +840,30 @@ fn stt_definition_to_config(
         config = config.with_sandbox(spec.sandbox_executable.clone().map(PathBuf::from));
     }
     Ok(config)
+}
+
+fn tts_definition_to_config(
+    definition: &TrustedLocalTtsDefinition,
+) -> Result<LocalTtsConfig, DaemonError> {
+    let spec = &definition.spec;
+    Ok(LocalTtsConfig {
+        command: spec.command.clone(),
+        voice: spec.voice.clone(),
+        model: PathBuf::from(&spec.model),
+        language: spec.language.clone(),
+        output_format: spec.output_format,
+        min_speed: spec.min_speed,
+        max_speed: spec.max_speed,
+        working_dir: PathBuf::from(&spec.working_dir),
+        environment: spec.environment.clone(),
+        timeout: std::time::Duration::from_millis(spec.timeout_ms),
+        max_frame_bytes: spec.max_frame_bytes,
+        max_audio_bytes: spec.max_audio_bytes,
+        max_stderr_bytes: spec.max_stderr_bytes,
+        max_restart_attempts: spec.max_restart_attempts,
+        sandbox_required: spec.sandbox_required,
+        sandbox_executable: spec.sandbox_executable.clone().map(PathBuf::from),
+    })
 }
 
 fn model_definition_to_config(
@@ -763,6 +932,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
                 | "allowed-root"
                 | "local-model-definition"
                 | "local-stt-definition"
+                | "local-tts-definition"
                 | "scope"
         ) {
             return Err(DaemonError::Config(format!("nieznany argument --{key}")));
@@ -794,6 +964,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
             .unwrap_or_else(|| DEFAULT_SCOPE.into()),
         local_model_definition: required("local-model-definition")?.into(),
         local_stt_definition: required("local-stt-definition")?.into(),
+        local_tts_definition: values.get("local-tts-definition").map(PathBuf::from),
     })
 }
 
@@ -817,6 +988,7 @@ mod tests {
             scope: "local".into(),
             local_model_definition: root.path().join("model.json"),
             local_stt_definition: root.path().join("stt.json"),
+            local_tts_definition: None,
         };
         assert!(config.validate().is_err());
     }
@@ -842,6 +1014,7 @@ mod tests {
             scope: "local".into(),
             local_model_definition: root.path().join("local-model.json"),
             local_stt_definition: root.path().join("local-stt.json"),
+            local_tts_definition: None,
         };
         assert!(load_local_model_definition(&config).is_err());
     }
@@ -859,6 +1032,7 @@ mod tests {
             scope: "local".into(),
             local_model_definition: root.path().join("local-model.json"),
             local_stt_definition: root.path().join("local-stt.json"),
+            local_tts_definition: None,
         };
         assert!(load_local_stt_definition(&config).is_err());
     }
@@ -934,6 +1108,7 @@ mod tests {
             scope: "local".into(),
             local_model_definition: model_path,
             local_stt_definition: stt_path,
+            local_tts_definition: None,
         })
         .await
         .unwrap();
