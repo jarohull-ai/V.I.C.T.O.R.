@@ -28,6 +28,17 @@ Tauri, egui i w testach.
 
 Decyzje o reuse: [`docs/ADR-001-reuse.md`](docs/ADR-001-reuse.md).
 
+## Licencja
+
+V.I.C.T.O.R. jest publicznie dostępnym kodem source-available na licencji
+Business Source License 1.1 (BUSL-1.1), a nie projektem open source przed datą
+zmiany licencji. Szczegóły parametrów, zakresu użycia niekomercyjnego i zasad
+użycia produkcyjnego znajdują się w pliku [`LICENSE`](LICENSE) oraz w
+[`docs/ADR-003-licensing.md`](docs/ADR-003-licensing.md).
+
+Katalog `vendor/bse-fetch` jest odrębnym wyjątkiem licencyjnym: pozostaje na
+licencji MIT i zachowuje własne pliki `LICENSE` oraz `ORIGIN.md`.
+
 ## Granica pluginów
 
 Zewnętrzne narzędzia działają jako ograniczone procesy potomne przez
