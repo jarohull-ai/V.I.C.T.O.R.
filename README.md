@@ -26,6 +26,21 @@ Tauri, egui i w testach.
 
 Decyzje o reuse: [`docs/ADR-001-reuse.md`](docs/ADR-001-reuse.md).
 
+## Granica pluginów
+
+Zewnętrzne narzędzia działają jako ograniczone procesy potomne przez
+`victor-plugin-host` i wersjonowany `victor-plugin-contract`. Manifest wire
+opisuje tylko tożsamość pluginu oraz schematy narzędzi. Capabilities, zakresy
+plików i risk nigdy nie są przyznawane przez plugin: pochodzą z lokalnego
+`victor-tools::ToolManifest` i przechodzą przez `victor-policy` w
+`victor-runtime`.
+
+Pierwszym testem produkcyjnego kształtu jest `plugin_sysinfo` — narzędzie R0,
+które raportuje dane CPU/RAM bez sieci i zapisu. Host używa JSON-over-stdio,
+limitów ramek, timeoutów, heartbeatów i najwyżej jednego kontrolowanego
+restartu po awarii procesu. WASM, biblioteki dynamiczne, proxy HTTP i kod
+generowany pozostają poza tą granicą.
+
 ## Uruchomienie
 
 ```sh

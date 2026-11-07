@@ -15,6 +15,8 @@ members = [
     "crates/victor-skill-cli",
     "crates/victor-stt-cloud",
     "crates/victor-runtime",
+    "crates/victor-plugin-contract",
+    "crates/victor-plugin-host",
 ]
 
 [workspace.package]
