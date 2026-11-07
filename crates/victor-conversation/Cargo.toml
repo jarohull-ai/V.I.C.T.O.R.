@@ -1,0 +1,24 @@
+[package]
+name = "victor-conversation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+victor-context = { path = "../victor-context" }
+victor-domain = { path = "../victor-domain" }
+victor-plugin-host = { path = "../victor-plugin-host" }
+victor-policy = { path = "../victor-policy" }
+victor-runtime = { path = "../victor-runtime" }
+victor-tools = { path = "../victor-tools" }
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+victor-policy = { path = "../victor-policy" }
+victor-storage = { path = "../victor-storage" }

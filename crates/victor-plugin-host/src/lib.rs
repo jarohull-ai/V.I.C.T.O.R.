@@ -717,6 +717,12 @@ pub struct PluginLifecycleApi {
 }
 
 impl PluginLifecycleApi {
+    /// Zwraca executor już uruchomionego, zarejestrowanego pluginu. Dostęp
+    /// pozostaje za bramą lifecycle; klient transportu nie otrzymuje hosta.
+    pub fn get(&self, id: &ToolId) -> Option<Arc<PluginToolExecutor>> {
+        self.host.get(id)
+    }
+
     pub async fn open(
         store: Arc<SqliteContextStore>,
         policy: Arc<PolicyEngine>,

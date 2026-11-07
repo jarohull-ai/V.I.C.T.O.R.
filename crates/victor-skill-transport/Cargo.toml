@@ -15,6 +15,7 @@ victor-skill-api = { path = "../victor-skill-api" }
 victor-skill-forge = { path = "../victor-skill-forge" }
 victor-skills = { path = "../victor-skills" }
 victor-domain = { path = "../victor-domain" }
+victor-conversation = { path = "../victor-conversation" }
 victor-plugin-host = { path = "../victor-plugin-host" }
 victor-tools = { path = "../victor-tools" }
 

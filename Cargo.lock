@@ -1870,6 +1870,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "victor-conversation"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "victor-context",
+ "victor-domain",
+ "victor-plugin-host",
+ "victor-policy",
+ "victor-runtime",
+ "victor-storage",
+ "victor-tools",
+]
+
+[[package]]
 name = "victor-daemon"
 version = "0.1.0"
 dependencies = [
@@ -1879,9 +1898,11 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "victor-conversation",
  "victor-domain",
  "victor-plugin-host",
  "victor-policy",
+ "victor-runtime",
  "victor-skill-api",
  "victor-skill-transport",
  "victor-storage",
@@ -2044,6 +2065,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "victor-conversation",
  "victor-domain",
  "victor-plugin-host",
  "victor-policy",

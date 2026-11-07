@@ -18,6 +18,7 @@ members = [
     "crates/victor-plugin-contract",
     "crates/victor-plugin-host",
     "crates/victor-daemon",
+    "crates/victor-conversation",
 ]
 
 [workspace.package]

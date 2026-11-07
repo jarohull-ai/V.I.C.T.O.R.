@@ -661,6 +661,32 @@ impl ToolResultStore for SqliteContextStore {
     }
 }
 
+impl victor_tools::AuditSink for SqliteContextStore {
+    fn record(&self, event: ToolAuditEvent) -> Result<(), ToolError> {
+        let connection = self.lock().map_err(|e| ToolError::Storage(e.to_string()))?;
+        connection
+            .execute(
+                "INSERT INTO tool_audit
+             (task_id, tool_id, tool_version, plan_hash, started_at, finished_at, outcome, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    event.task_id,
+                    event.tool.as_str(),
+                    event.tool_version,
+                    event.plan_hash,
+                    i64::try_from(event.started_at_unix_ms)
+                        .map_err(|_| ToolError::Storage("started_at przekracza i64".into()))?,
+                    i64::try_from(event.finished_at_unix_ms)
+                        .map_err(|_| ToolError::Storage("finished_at przekracza i64".into()))?,
+                    audit_outcome(event.outcome),
+                    event.summary,
+                ],
+            )
+            .map_err(|e| ToolError::Storage(e.to_string()))?;
+        Ok(())
+    }
+}
+
 impl SkillDecisionAuditSink for SqliteContextStore {
     fn record_skill_decision(&self, event: SkillDecisionAudit) -> Result<(), String> {
         let connection = self.lock().map_err(|error| error.to_string())?;

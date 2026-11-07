@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
+use victor_conversation::ConversationService;
 use victor_domain::{Approval, ToolId};
 use victor_plugin_host::{PluginLaunchRequest, PluginLifecycleApi};
 use victor_skill_api::{SkillApi, SkillApiError};
@@ -25,6 +26,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum SkillOperation {
+    Chat {
+        conversation_id: String,
+        input: String,
+        at_unix_ms: u64,
+        approval: Option<Approval>,
+    },
     List,
     Review {
         skill_id: SkillId,
@@ -142,6 +149,7 @@ pub enum TransportError {
 struct ServerState {
     api: SkillApi,
     plugin_api: Option<Arc<Mutex<PluginLifecycleApi>>>,
+    conversation: Option<Arc<dyn ConversationService>>,
     token: String,
     scope: String,
     max_request_bytes: usize,
@@ -181,6 +189,7 @@ impl UnixSkillServer {
             state: Arc::new(Mutex::new(ServerState {
                 api,
                 plugin_api: None,
+                conversation: None,
                 token,
                 scope,
                 max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
@@ -191,8 +200,19 @@ impl UnixSkillServer {
     }
 
     pub fn with_plugin_api(self, plugin_api: PluginLifecycleApi) -> Self {
+        self.with_plugin_api_shared(Arc::new(Mutex::new(plugin_api)))
+    }
+
+    pub fn with_plugin_api_shared(self, plugin_api: Arc<Mutex<PluginLifecycleApi>>) -> Self {
         if let Ok(mut guard) = self.state.try_lock() {
-            guard.plugin_api = Some(Arc::new(Mutex::new(plugin_api)));
+            guard.plugin_api = Some(plugin_api);
+        }
+        self
+    }
+
+    pub fn with_conversation(self, service: Arc<dyn ConversationService>) -> Self {
+        if let Ok(mut guard) = self.state.try_lock() {
+            guard.conversation = Some(service);
         }
         self
     }
@@ -384,6 +404,27 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         }
     }
     let result: Result<Value, String> = match request.operation {
+        SkillOperation::Chat {
+            conversation_id,
+            input,
+            at_unix_ms,
+            approval,
+        } => {
+            let Some(service) = guard.conversation.as_ref().cloned() else {
+                return failure("conversation API nie jest skonfigurowane");
+            };
+            service
+                .chat(
+                    conversation_id,
+                    request.scope.clone(),
+                    input,
+                    at_unix_ms,
+                    approval,
+                )
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
+        }
         SkillOperation::List => {
             serde_json::to_value(guard.api.list()).map_err(|error| error.to_string())
         }

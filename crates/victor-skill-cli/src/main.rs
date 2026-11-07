@@ -13,7 +13,7 @@ use victor_skill_transport::{PluginOperation, SkillOperation, SkillRequest, Skil
 use victor_skills::{SkillId, SkillManifest};
 
 fn usage() -> &'static str {
-    "victor-skill --socket PATH --token TOKEN --scope SCOPE <list|review|draft|update|approve|disable|rollback|audit|plugin> [args]"
+    "victor-skill --socket PATH --token TOKEN --scope SCOPE <chat|list|review|draft|update|approve|disable|rollback|audit|plugin> [args]"
 }
 
 fn main() {
@@ -67,6 +67,28 @@ fn take_option(args: &mut Vec<String>, name: &str) -> Option<String> {
 
 fn build_operation(name: &str, args: &[String]) -> Result<SkillOperation, String> {
     match name {
+        "chat" => {
+            let conversation_id = args.first().ok_or("chat wymaga CONVERSATION_ID")?.clone();
+            let at_unix_ms = named_arg(args, "--at")
+                .ok_or("chat wymaga --at UNIX_MS")?
+                .parse()
+                .map_err(|_| "--at musi być liczbą UNIX_MS")?;
+            let input = args[1..]
+                .iter()
+                .take_while(|arg| arg.as_str() != "--at")
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if input.trim().is_empty() {
+                return Err("chat wymaga tekstu wiadomości".into());
+            }
+            Ok(SkillOperation::Chat {
+                conversation_id,
+                input,
+                at_unix_ms,
+                approval: None,
+            })
+        }
         "plugin" => Ok(SkillOperation::Plugin {
             plugin_operation: build_plugin_operation(args)?,
         }),
@@ -315,6 +337,11 @@ fn idempotency_key(operation: &SkillOperation) -> Option<String> {
             at_unix_ms,
             ..
         } => Some(format!("cli:{}:{at_unix_ms}", skill_id)),
+        SkillOperation::Chat {
+            conversation_id,
+            at_unix_ms,
+            ..
+        } => Some(format!("cli-chat:{conversation_id}:{at_unix_ms}")),
         _ => None,
     }
 }

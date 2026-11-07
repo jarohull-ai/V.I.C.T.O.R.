@@ -8,9 +8,15 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
+use victor_conversation::{
+    ConversationEngine, ConversationLimits, ConversationRouter, ConversationService,
+    DeterministicTestModel,
+};
 use victor_domain::ToolId;
 use victor_plugin_host::{PluginLaunchPolicy, PluginLaunchRequest, PluginLifecycleApi};
 use victor_policy::{PolicyConfig, PolicyEngine};
+use victor_runtime::ToolRuntime;
 use victor_skill_api::SkillApi;
 use victor_skill_transport::UnixSkillServer;
 use victor_storage::SqliteContextStore;
@@ -97,9 +103,13 @@ impl Daemon {
                 .map_err(|e| DaemonError::Storage(e.to_string()))?,
         );
         let mut registry = ToolRegistry::new();
+        let mut runtime_registry = ToolRegistry::new();
         let mut enabled = Vec::new();
         for definition in &definitions {
             registry
+                .register(definition.manifest.clone())
+                .map_err(|e| DaemonError::Config(e.to_string()))?;
+            runtime_registry
                 .register(definition.manifest.clone())
                 .map_err(|e| DaemonError::Config(e.to_string()))?;
             enabled.push(definition.id.clone());
@@ -116,9 +126,10 @@ impl Daemon {
         );
         let skill_api = SkillApi::new(Arc::new(registry), policy.clone(), store.clone())
             .map_err(|e| DaemonError::Skill(e.to_string()))?;
-        let mut plugin_api = PluginLifecycleApi::open(store, policy, None)
-            .await
-            .map_err(|e| DaemonError::Host(e.to_string()))?;
+        let mut plugin_api =
+            PluginLifecycleApi::open(store.clone(), policy.clone(), Some(store.clone()))
+                .await
+                .map_err(|e| DaemonError::Host(e.to_string()))?;
         for definition in definitions {
             plugin_api = plugin_api
                 .with_plugin_definition(
@@ -128,9 +139,32 @@ impl Daemon {
                 )
                 .map_err(|e| DaemonError::Host(e.to_string()))?;
         }
+        let plugin_api = Arc::new(Mutex::new(plugin_api));
+        let runtime_registry = Arc::new(runtime_registry);
+        let runtime = Arc::new(
+            ToolRuntime::new(
+                runtime_registry.clone(),
+                policy,
+                store.clone(),
+                store.clone(),
+            )
+            .with_transactional_store(store.clone()),
+        );
+        let router = ConversationRouter::new(
+            Arc::new(DeterministicTestModel),
+            runtime,
+            runtime_registry,
+            plugin_api.clone(),
+        );
+        let conversation: Arc<dyn ConversationService> = Arc::new(ConversationEngine::new(
+            router,
+            store.clone(),
+            ConversationLimits::default(),
+        ));
         let server = UnixSkillServer::new(&config.socket_path, token, &config.scope, skill_api)
             .map_err(|e| DaemonError::Transport(e.to_string()))?
-            .with_plugin_api(plugin_api);
+            .with_plugin_api_shared(plugin_api)
+            .with_conversation(conversation);
         Ok(Self {
             config,
             server: Some(server),
