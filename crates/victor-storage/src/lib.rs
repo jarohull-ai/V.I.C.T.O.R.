@@ -4,6 +4,7 @@
 //! zależały od kształtu JSON-a. InMemoryContextStore pozostaje właściwy dla
 //! szybkich testów; ten backend służy do restartów i atomowego wyniku narzędzia.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -34,10 +35,20 @@ pub struct SqliteContextStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginRegistrationRecord {
     pub plugin_id: String,
+    pub plugin_version: String,
     pub manifest_json: String,
     pub manifest_hash: String,
     pub command: Vec<String>,
+    pub executable_path: String,
+    pub executable_hash: String,
+    pub working_dir: String,
+    pub environment: BTreeMap<String, String>,
     pub sandbox_required: bool,
+    pub sandbox_executable: Option<String>,
+    pub request_timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_restart_attempts: u32,
+    pub launch_spec_hash: String,
     pub status: String,
 }
 
@@ -122,13 +133,47 @@ impl SqliteContextStore {
              );
              CREATE TABLE IF NOT EXISTS plugin_registrations (
                  plugin_id TEXT PRIMARY KEY,
+                 plugin_version TEXT NOT NULL,
                  manifest_json TEXT NOT NULL,
                  manifest_hash TEXT NOT NULL,
                  command_json TEXT NOT NULL,
+                 executable_path TEXT NOT NULL,
+                 executable_hash TEXT NOT NULL,
+                 working_dir TEXT NOT NULL,
+                 environment_json TEXT NOT NULL,
                  sandbox_required INTEGER NOT NULL CHECK (sandbox_required IN (0, 1)),
+                 sandbox_executable TEXT,
+                 request_timeout_ms INTEGER NOT NULL,
+                 max_frame_bytes INTEGER NOT NULL,
+                 max_restart_attempts INTEGER NOT NULL,
+                 launch_spec_hash TEXT NOT NULL,
                  status TEXT NOT NULL CHECK (status IN ('active', 'disabled'))
              );",
         )?;
+        let columns = connection
+            .prepare("PRAGMA table_info(plugin_registrations)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let migrations = [
+            ("plugin_version", "TEXT NOT NULL DEFAULT ''"),
+            ("executable_path", "TEXT NOT NULL DEFAULT ''"),
+            ("executable_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("working_dir", "TEXT NOT NULL DEFAULT ''"),
+            ("environment_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("sandbox_executable", "TEXT"),
+            ("request_timeout_ms", "INTEGER NOT NULL DEFAULT 30000"),
+            ("max_frame_bytes", "INTEGER NOT NULL DEFAULT 262144"),
+            ("max_restart_attempts", "INTEGER NOT NULL DEFAULT 1"),
+            ("launch_spec_hash", "TEXT NOT NULL DEFAULT ''"),
+        ];
+        for (column, definition) in migrations {
+            if !columns.contains(column) {
+                connection.execute(
+                    &format!("ALTER TABLE plugin_registrations ADD COLUMN {column} {definition}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -160,23 +205,48 @@ impl SqliteContextStore {
     ) -> Result<(), StorageError> {
         let command_json = serde_json::to_string(&record.command)
             .map_err(|error| StorageError::Invalid(error.to_string()))?;
+        let environment_json = serde_json::to_string(&record.environment)
+            .map_err(|error| StorageError::Invalid(error.to_string()))?;
         let connection = self.lock()?;
         connection.execute(
             "INSERT INTO plugin_registrations
-             (plugin_id, manifest_json, manifest_hash, command_json, sandbox_required, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             (plugin_id, plugin_version, manifest_json, manifest_hash, command_json,
+              executable_path, executable_hash, working_dir, environment_json,
+              sandbox_required, sandbox_executable, request_timeout_ms, max_frame_bytes,
+              max_restart_attempts, launch_spec_hash, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(plugin_id) DO UPDATE SET
+               plugin_version=excluded.plugin_version,
                manifest_json=excluded.manifest_json,
                manifest_hash=excluded.manifest_hash,
                command_json=excluded.command_json,
+               executable_path=excluded.executable_path,
+               executable_hash=excluded.executable_hash,
+               working_dir=excluded.working_dir,
+               environment_json=excluded.environment_json,
                sandbox_required=excluded.sandbox_required,
+               sandbox_executable=excluded.sandbox_executable,
+               request_timeout_ms=excluded.request_timeout_ms,
+               max_frame_bytes=excluded.max_frame_bytes,
+               max_restart_attempts=excluded.max_restart_attempts,
+               launch_spec_hash=excluded.launch_spec_hash,
                status=excluded.status",
             params![
                 record.plugin_id,
+                record.plugin_version,
                 record.manifest_json,
                 record.manifest_hash,
                 command_json,
+                record.executable_path,
+                record.executable_hash,
+                record.working_dir,
+                environment_json,
                 i64::from(record.sandbox_required),
+                record.sandbox_executable,
+                record.request_timeout_ms,
+                record.max_frame_bytes as u64,
+                record.max_restart_attempts,
+                record.launch_spec_hash,
                 record.status,
             ],
         )?;
@@ -200,29 +270,63 @@ impl SqliteContextStore {
         Ok(())
     }
 
+    pub fn remove_plugin_registration(&self, plugin_id: &str) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "DELETE FROM plugin_registrations WHERE plugin_id = ?1",
+            params![plugin_id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Invalid(
+                "plugin nie jest zarejestrowany".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn plugin_registrations(&self) -> Result<Vec<PluginRegistrationRecord>, StorageError> {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
-            "SELECT plugin_id, manifest_json, manifest_hash, command_json,
-                    sandbox_required, status
+            "SELECT plugin_id, plugin_version, manifest_json, manifest_hash, command_json,
+                    executable_path, executable_hash, working_dir, environment_json,
+                    sandbox_required, sandbox_executable, request_timeout_ms,
+                    max_frame_bytes, max_restart_attempts, launch_spec_hash, status
              FROM plugin_registrations ORDER BY plugin_id ASC",
         )?;
         let rows = statement.query_map([], |row| {
-            let command_json: String = row.get(3)?;
+            let command_json: String = row.get(4)?;
             let command = serde_json::from_str(&command_json).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    3,
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let environment_json: String = row.get(8)?;
+            let environment = serde_json::from_str(&environment_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    8,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
             })?;
             Ok(PluginRegistrationRecord {
                 plugin_id: row.get(0)?,
-                manifest_json: row.get(1)?,
-                manifest_hash: row.get(2)?,
+                plugin_version: row.get(1)?,
+                manifest_json: row.get(2)?,
+                manifest_hash: row.get(3)?,
                 command,
-                sandbox_required: row.get::<_, i64>(4)? != 0,
-                status: row.get(5)?,
+                executable_path: row.get(5)?,
+                executable_hash: row.get(6)?,
+                working_dir: row.get(7)?,
+                environment,
+                sandbox_required: row.get::<_, i64>(9)? != 0,
+                sandbox_executable: row.get(10)?,
+                request_timeout_ms: row.get::<_, u64>(11)?,
+                max_frame_bytes: row.get::<_, u64>(12)? as usize,
+                max_restart_attempts: row.get::<_, u32>(13)?,
+                launch_spec_hash: row.get(14)?,
+                status: row.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -807,10 +911,20 @@ mod tests {
         let file = tempfile::NamedTempFile::new().unwrap();
         let record = PluginRegistrationRecord {
             plugin_id: "plugin_sysinfo".into(),
+            plugin_version: "1.0.0".into(),
             manifest_json: "{\"manifest\":true}".into(),
             manifest_hash: "sha256:test".into(),
             command: vec!["plugin_sysinfo".into(), "normal".into()],
+            executable_path: "plugin_sysinfo".into(),
+            executable_hash: "sha256:executable".into(),
+            working_dir: "/tmp".into(),
+            environment: BTreeMap::new(),
             sandbox_required: false,
+            sandbox_executable: None,
+            request_timeout_ms: 30_000,
+            max_frame_bytes: 256 * 1024,
+            max_restart_attempts: 1,
+            launch_spec_hash: "sha256:launch".into(),
             status: "active".into(),
         };
         {

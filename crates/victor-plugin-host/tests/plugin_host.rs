@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use serde_json::json;
@@ -40,10 +42,16 @@ fn manifest() -> ToolManifest {
 }
 
 fn fixture(mode: &str, extra: Option<&std::path::Path>) -> Vec<String> {
-    let mut command = vec![
-        env!("CARGO_BIN_EXE_plugin_fixture").to_string(),
-        mode.into(),
-    ];
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_plugin_fixture"));
+    let metadata = std::fs::metadata(executable).unwrap();
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(permissions.mode() & !0o022);
+        std::fs::set_permissions(executable, permissions).unwrap();
+    }
+    let mut command = vec![executable.display().to_string(), mode.into()];
     if let Some(path) = extra {
         command.push(path.display().to_string());
     }
@@ -344,6 +352,149 @@ async fn policy_denies_plugin_before_executor_for_unsafe_local_manifest() {
         audit.0.lock().unwrap()[0].outcome,
         victor_tools::AuditOutcome::Denied
     );
+}
+
+#[tokio::test]
+async fn lifecycle_persists_full_launch_spec_and_requires_explicit_unregister() {
+    let database = tempfile::NamedTempFile::new().unwrap();
+    let working_dir = tempdir().unwrap();
+    let store = Arc::new(SqliteContextStore::open(database.path()).unwrap());
+    let lifecycle_audit = Arc::new(Audits::default());
+    std::env::set_var("VICTOR_TEST_SECRET", "must-not-leak");
+    let mut policy = PluginLaunchPolicy {
+        working_dir: Some(working_dir.path().to_path_buf()),
+        environment: BTreeMap::from([(String::from("VICTOR_ALLOWED"), String::from("yes"))]),
+        ..PluginLaunchPolicy::default()
+    };
+    let mut host = PersistentPluginHost::open(store.clone(), Some(lifecycle_audit.clone()))
+        .await
+        .unwrap();
+    let mut registry = ToolRegistry::new();
+    let command = fixture("cwd-env", None);
+    host.register_into_registry(command, manifest(), policy.clone(), &mut registry)
+        .await
+        .unwrap();
+    let executor = host.get(&ToolId::parse("plugin_sysinfo").unwrap()).unwrap();
+    let result = executor.execute(json!({}), 30).await.unwrap();
+    assert_eq!(result.output["allowed"], "yes");
+    assert_eq!(result.output["secret_present"], false);
+    assert_eq!(
+        result.output["cwd"],
+        working_dir.path().display().to_string()
+    );
+    assert!(host
+        .unregister(&ToolId::parse("plugin_sysinfo").unwrap(), false)
+        .is_err());
+    host.disable(&ToolId::parse("plugin_sysinfo").unwrap())
+        .unwrap();
+    assert!(host
+        .get(&ToolId::parse("plugin_sysinfo").unwrap())
+        .is_none());
+    host.activate(&ToolId::parse("plugin_sysinfo").unwrap(), &mut registry)
+        .await
+        .unwrap();
+    host.restart(&ToolId::parse("plugin_sysinfo").unwrap())
+        .await
+        .unwrap();
+    host.unregister(&ToolId::parse("plugin_sysinfo").unwrap(), true)
+        .unwrap();
+    assert!(store.plugin_registrations().unwrap().is_empty());
+    assert!(lifecycle_audit.0.lock().unwrap().len() >= 5);
+    std::env::remove_var("VICTOR_TEST_SECRET");
+    policy.environment.insert("API_TOKEN".into(), "x".into());
+    assert!(matches!(
+        PluginToolExecutor::spawn_with_policy(fixture("normal", None), manifest(), policy, None)
+            .await,
+        Err(HostError::InvalidLaunchPolicy(_))
+    ));
+}
+
+#[tokio::test]
+async fn registration_is_idempotent_but_manifest_conflicts_are_rejected() {
+    let database = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(SqliteContextStore::open(database.path()).unwrap());
+    let mut host = PersistentPluginHost::open(store, None).await.unwrap();
+    let command = fixture("normal", None);
+    let first = host
+        .register(command.clone(), manifest(), PluginLaunchPolicy::default())
+        .await
+        .unwrap();
+    let second = host
+        .register(command, manifest(), PluginLaunchPolicy::default())
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    let mut changed = manifest();
+    changed.tool_version = "2.0.0".into();
+    assert!(matches!(
+        host.register(
+            fixture("normal", None),
+            changed,
+            PluginLaunchPolicy::default()
+        )
+        .await,
+        Err(HostError::RegistrationConflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn restore_rejects_changed_binary_symlink_and_missing_working_dir() {
+    let executable_source = std::path::Path::new(env!("CARGO_BIN_EXE_plugin_fixture"));
+    let directory = tempdir().unwrap();
+    let executable = directory.path().join("plugin-fixture");
+    std::fs::copy(executable_source, &executable).unwrap();
+    let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+    }
+    let database = tempfile::NamedTempFile::new().unwrap();
+    let store = Arc::new(SqliteContextStore::open(database.path()).unwrap());
+    let mut host = PersistentPluginHost::open(store.clone(), None)
+        .await
+        .unwrap();
+    host.register(
+        vec![executable.display().to_string(), "normal".into()],
+        manifest(),
+        PluginLaunchPolicy::default(),
+    )
+    .await
+    .unwrap();
+    drop(host);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&executable)
+        .unwrap()
+        .write_all(b"changed")
+        .unwrap();
+    assert!(matches!(
+        PersistentPluginHost::open(store.clone(), None).await,
+        Err(HostError::StaleLaunchSpec(_))
+    ));
+
+    let symlink = directory.path().join("plugin-link");
+    std::os::unix::fs::symlink(executable_source, &symlink).unwrap();
+    assert!(matches!(
+        PluginToolExecutor::spawn(
+            vec![symlink.display().to_string(), "normal".into()],
+            manifest()
+        )
+        .await,
+        Err(HostError::UnsafeExecutable(_))
+    ));
+    let missing = directory.path().join("missing");
+    let policy = PluginLaunchPolicy {
+        working_dir: Some(missing),
+        ..PluginLaunchPolicy::default()
+    };
+    assert!(matches!(
+        PluginToolExecutor::spawn_with_policy(fixture("normal", None), manifest(), policy, None)
+            .await,
+        Err(HostError::InvalidLaunchPolicy(_))
+    ));
 }
 
 fn assert_no_recorded_pids_alive(path: &std::path::Path) {

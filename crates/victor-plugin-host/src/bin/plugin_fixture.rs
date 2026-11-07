@@ -114,6 +114,19 @@ fn main() {
                     finished_at_unix_ms: 2,
                 }),
             ),
+            WireMessage::Request(Request { request_id, .. }) if mode == "cwd-env" => write_message(
+                &mut out,
+                WireMessage::Response(Response {
+                    request_id,
+                    output: serde_json::json!({
+                        "cwd": std::env::current_dir().unwrap().display().to_string(),
+                        "allowed": std::env::var("VICTOR_ALLOWED").unwrap_or_default(),
+                        "secret_present": std::env::var("VICTOR_TEST_SECRET").is_ok()
+                    }),
+                    summary: "launch spec checked".into(),
+                    finished_at_unix_ms: 2,
+                }),
+            ),
             WireMessage::Request(Request { request_id, .. }) => write_message(
                 &mut out,
                 WireMessage::Response(Response {

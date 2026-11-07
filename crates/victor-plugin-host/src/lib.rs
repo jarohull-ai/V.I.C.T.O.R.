@@ -4,7 +4,10 @@
 //! nadal własnością `victor-runtime`; ten crate dostarcza wyłącznie executor.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +21,9 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use victor_domain::{ToolId, UnixMs};
 use victor_plugin_contract::{
-    decode_frame, encode, Hello, PluginManifest, Request, Response, WireMessage,
-    DEFAULT_HEARTBEAT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    decode_frame_with_limit, encode_with_limit, Hello, PluginManifest, Request, Response,
+    WireMessage, DEFAULT_HEARTBEAT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION,
 };
 use victor_storage::{PluginRegistrationRecord, SqliteContextStore};
 use victor_tools::{
@@ -52,12 +56,21 @@ pub enum HostError {
     SandboxUnavailable,
     #[error("nieprawidłowa polityka uruchomienia pluginu: {0}")]
     InvalidLaunchPolicy(String),
+    #[error("konflikt istniejącej rejestracji pluginu: {0}")]
+    RegistrationConflict(String),
+    #[error("plugin nie istnieje: {0}")]
+    NotRegistered(String),
+    #[error("niebezpieczny executable pluginu: {0}")]
+    UnsafeExecutable(String),
+    #[error("launch spec pluginu jest nieaktualny: {0}")]
+    StaleLaunchSpec(String),
 }
 
 struct ProcessConnection {
     child: Child,
     stdin: BufWriter<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    max_frame_bytes: usize,
 }
 
 impl ProcessConnection {
@@ -80,6 +93,9 @@ pub struct PluginLaunchPolicy {
     pub sandbox_executable: Option<PathBuf>,
     pub working_dir: Option<PathBuf>,
     pub environment: BTreeMap<String, String>,
+    pub request_timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_restart_attempts: u32,
 }
 
 impl Default for PluginLaunchPolicy {
@@ -89,6 +105,9 @@ impl Default for PluginLaunchPolicy {
             sandbox_executable: None,
             working_dir: None,
             environment: BTreeMap::new(),
+            request_timeout_ms: DEFAULT_REQUEST_TIMEOUT_MS,
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_restart_attempts: DEFAULT_MAX_RESTART_ATTEMPTS,
         }
     }
 }
@@ -163,7 +182,8 @@ impl SandboxRunner for BubblewrapSandboxRunner {
 
 impl ProcessConnection {
     async fn send(&mut self, message: &WireMessage) -> Result<(), HostError> {
-        let frame = encode(message).map_err(|_| HostError::FrameTooLarge)?;
+        let frame = encode_with_limit(message, self.max_frame_bytes)
+            .map_err(|_| HostError::FrameTooLarge)?;
         self.stdin
             .write_all(&frame)
             .await
@@ -178,7 +198,7 @@ impl ProcessConnection {
     async fn receive(&mut self, timeout_ms: u64) -> Result<WireMessage, HostError> {
         let line = timeout(
             Duration::from_millis(timeout_ms),
-            read_limited_frame(&mut self.stdout, MAX_FRAME_BYTES),
+            read_limited_frame(&mut self.stdout, self.max_frame_bytes),
         )
         .await
         .map_err(|_| HostError::Timeout(timeout_ms))?
@@ -195,7 +215,7 @@ impl ProcessConnection {
         if line.len() > MAX_FRAME_BYTES {
             return Err(HostError::FrameTooLarge);
         }
-        decode_frame(&line).map_err(|e| match e {
+        decode_frame_with_limit(&line, self.max_frame_bytes).map_err(|e| match e {
             victor_plugin_contract::ContractError::FrameTooLarge { .. } => HostError::FrameTooLarge,
             victor_plugin_contract::ContractError::MissingFrameDelimiter => {
                 HostError::InvalidFraming("brak delimitera ramki".into())
@@ -344,6 +364,39 @@ pub struct PersistentPluginHost {
 }
 
 impl PersistentPluginHost {
+    fn record_lifecycle(
+        &self,
+        id: &ToolId,
+        outcome: AuditOutcome,
+        summary: &str,
+    ) -> Result<(), HostError> {
+        let Some(audit) = &self.audit else {
+            return Ok(());
+        };
+        let version = self
+            .store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|record| record.plugin_id == id.as_str())
+            .map(|record| record.plugin_version)
+            .unwrap_or_else(|| "unknown".into());
+        audit
+            .record(ToolAuditEvent {
+                task_id: format!("plugin-lifecycle:{id}"),
+                tool: id.clone(),
+                tool_version: version,
+                plan_hash: "plugin-lifecycle".into(),
+                started_at_unix_ms: 0,
+                finished_at_unix_ms: 0,
+                outcome,
+                summary: summary.into(),
+            })
+            .map_err(|error| HostError::Spawn(format!("audit lifecycle pluginu: {error}")))
+    }
+}
+
+impl PersistentPluginHost {
     pub async fn open(
         store: Arc<SqliteContextStore>,
         audit: Option<Arc<dyn AuditSink>>,
@@ -371,14 +424,8 @@ impl PersistentPluginHost {
                     record.plugin_id
                 )));
             }
-            let policy = PluginLaunchPolicy {
-                sandbox: if record.sandbox_required {
-                    SandboxRequirement::Required
-                } else {
-                    SandboxRequirement::NotRequired
-                },
-                ..PluginLaunchPolicy::default()
-            };
+            validate_persisted_launch_spec(&record, &manifest)?;
+            let policy = policy_from_record(&record);
             persistent
                 .host
                 .register_with_policy(record.command, manifest, policy, persistent.audit.clone())
@@ -394,8 +441,51 @@ impl PersistentPluginHost {
         launch_policy: PluginLaunchPolicy,
     ) -> Result<Arc<PluginToolExecutor>, HostError> {
         let plugin_id = manifest.descriptor.id.as_str().to_string();
+        let launch_policy = normalize_launch_policy(launch_policy)?;
+        let (executable_path, executable_hash) = validate_executable(&command)?;
+        let manifest_hash_value = manifest_hash(&manifest)?;
         let manifest_json = serde_json::to_string(&manifest)
             .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        let working_dir = launch_policy
+            .working_dir
+            .as_ref()
+            .expect("normalized launch policy has working directory");
+        let mut record = PluginRegistrationRecord {
+            plugin_id: plugin_id.clone(),
+            plugin_version: manifest.tool_version.clone(),
+            manifest_json,
+            manifest_hash: manifest_hash_value,
+            command: command.clone(),
+            executable_path: executable_path.display().to_string(),
+            executable_hash,
+            working_dir: working_dir.display().to_string(),
+            environment: launch_policy.environment.clone(),
+            sandbox_required: matches!(launch_policy.sandbox, SandboxRequirement::Required),
+            sandbox_executable: launch_policy
+                .sandbox_executable
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            request_timeout_ms: launch_policy.request_timeout_ms,
+            max_frame_bytes: launch_policy.max_frame_bytes,
+            max_restart_attempts: launch_policy.max_restart_attempts,
+            launch_spec_hash: String::new(),
+            status: "active".into(),
+        };
+        record.launch_spec_hash = launch_spec_hash(&record)?;
+        if let Some(existing) = self
+            .store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|item| item.plugin_id == plugin_id)
+        {
+            if existing != record {
+                return Err(HostError::RegistrationConflict(plugin_id));
+            }
+            if let Some(existing_executor) = self.host.get(&manifest.descriptor.id) {
+                return Ok(existing_executor);
+            }
+        }
         let executor = self
             .host
             .register_with_policy(
@@ -406,15 +496,13 @@ impl PersistentPluginHost {
             )
             .await?;
         self.store
-            .save_plugin_registration(&PluginRegistrationRecord {
-                plugin_id,
-                manifest_json,
-                manifest_hash: manifest_hash(&manifest)?,
-                command,
-                sandbox_required: matches!(launch_policy.sandbox, SandboxRequirement::Required),
-                status: "active".into(),
-            })
+            .save_plugin_registration(&record)
             .map_err(storage_host_error)?;
+        self.record_lifecycle(
+            &manifest.descriptor.id,
+            AuditOutcome::Succeeded,
+            "register active",
+        )?;
         Ok(executor)
     }
 
@@ -452,10 +540,85 @@ impl PersistentPluginHost {
     }
 
     pub fn disable(&mut self, id: &ToolId) -> Result<(), HostError> {
-        self.host.tools.remove(id.as_str());
+        if self.host.tools.remove(id.as_str()).is_none()
+            && !self
+                .store
+                .plugin_registrations()
+                .map_err(storage_host_error)?
+                .iter()
+                .any(|record| record.plugin_id == id.as_str())
+        {
+            return Err(HostError::NotRegistered(id.to_string()));
+        }
         self.store
             .set_plugin_status(id.as_str(), "disabled")
-            .map_err(storage_host_error)
+            .map_err(storage_host_error)?;
+        self.record_lifecycle(id, AuditOutcome::Succeeded, "disable")
+    }
+
+    pub async fn activate(
+        &mut self,
+        id: &ToolId,
+        registry: &mut victor_tools::ToolRegistry,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let record = self
+            .store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|record| record.plugin_id == id.as_str())
+            .ok_or_else(|| HostError::NotRegistered(id.to_string()))?;
+        if record.status == "active" {
+            if let Some(executor) = self.host.get(id) {
+                return Ok(executor);
+            }
+        }
+        let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        validate_persisted_launch_spec(&record, &manifest)?;
+        let policy = policy_from_record(&record);
+        let executor = self
+            .host
+            .register_with_policy(
+                record.command.clone(),
+                manifest.clone(),
+                policy,
+                self.audit.clone(),
+            )
+            .await?;
+        if registry.get(id).is_none() {
+            registry
+                .register(manifest)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        }
+        self.store
+            .set_plugin_status(id.as_str(), "active")
+            .map_err(storage_host_error)?;
+        self.record_lifecycle(id, AuditOutcome::Succeeded, "activate")?;
+        Ok(executor)
+    }
+
+    pub async fn restart(&mut self, id: &ToolId) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let executor = self
+            .host
+            .get(id)
+            .ok_or_else(|| HostError::NotRegistered(id.to_string()))?;
+        executor.restart().await?;
+        self.record_lifecycle(id, AuditOutcome::Succeeded, "restart")?;
+        Ok(executor)
+    }
+
+    pub fn unregister(&mut self, id: &ToolId, explicit_decision: bool) -> Result<(), HostError> {
+        if !explicit_decision {
+            return Err(HostError::InvalidLaunchPolicy(
+                "unregister wymaga jawnej decyzji użytkownika".into(),
+            ));
+        }
+        self.host.tools.remove(id.as_str());
+        self.store
+            .remove_plugin_registration(id.as_str())
+            .map_err(storage_host_error)?;
+        self.record_lifecycle(id, AuditOutcome::Succeeded, "unregister")
     }
 }
 
@@ -466,6 +629,151 @@ fn storage_host_error(error: impl std::fmt::Display) -> HostError {
 fn manifest_hash(manifest: &ToolManifest) -> Result<String, HostError> {
     let bytes = serde_json::to_vec(manifest)
         .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn policy_from_record(record: &PluginRegistrationRecord) -> PluginLaunchPolicy {
+    PluginLaunchPolicy {
+        sandbox: if record.sandbox_required {
+            SandboxRequirement::Required
+        } else {
+            SandboxRequirement::NotRequired
+        },
+        sandbox_executable: record.sandbox_executable.as_ref().map(PathBuf::from),
+        working_dir: Some(PathBuf::from(&record.working_dir)),
+        environment: record.environment.clone(),
+        request_timeout_ms: record.request_timeout_ms,
+        max_frame_bytes: record.max_frame_bytes,
+        max_restart_attempts: record.max_restart_attempts,
+    }
+}
+
+fn validate_persisted_launch_spec(
+    record: &PluginRegistrationRecord,
+    manifest: &ToolManifest,
+) -> Result<(), HostError> {
+    if record.plugin_id != manifest.descriptor.id.as_str()
+        || record.plugin_version != manifest.tool_version
+        || manifest_hash(manifest)? != record.manifest_hash
+    {
+        return Err(HostError::StaleLaunchSpec(
+            "manifest, wersja lub hash ToolManifest nie pasują".into(),
+        ));
+    }
+    if launch_spec_hash(record)? != record.launch_spec_hash {
+        return Err(HostError::StaleLaunchSpec(
+            "hash pełnego launch spec nie pasuje".into(),
+        ));
+    }
+    let policy = policy_from_record(record);
+    validate_launch_policy(&policy)?;
+    let (path, hash) = validate_executable(&record.command)?;
+    if path.display().to_string() != record.executable_path || hash != record.executable_hash {
+        return Err(HostError::StaleLaunchSpec(
+            "executable zmienił się albo nie pasuje do zapisanego identity".into(),
+        ));
+    }
+    if record.command.first().map(Path::new) != Some(path.as_path()) {
+        return Err(HostError::StaleLaunchSpec(
+            "komenda nie wskazuje na zapisany executable".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_launch_policy(
+    mut policy: PluginLaunchPolicy,
+) -> Result<PluginLaunchPolicy, HostError> {
+    if policy.working_dir.is_none() {
+        policy.working_dir = Some(
+            std::env::current_dir()
+                .map_err(|error| HostError::InvalidLaunchPolicy(error.to_string()))?,
+        );
+    }
+    if matches!(policy.sandbox, SandboxRequirement::Required) && policy.sandbox_executable.is_none()
+    {
+        policy.sandbox_executable =
+            BubblewrapSandboxRunner::detect().map(|runner| runner.executable);
+    }
+    validate_launch_policy(&policy)?;
+    Ok(policy)
+}
+
+fn validate_executable(command: &[String]) -> Result<(PathBuf, String), HostError> {
+    let raw = command
+        .first()
+        .ok_or_else(|| HostError::Spawn("pusta komenda pluginu".into()))?;
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err(HostError::UnsafeExecutable(
+            "ścieżka executable musi być absolutna".into(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| HostError::UnsafeExecutable(error.to_string()))?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(HostError::UnsafeExecutable(
+            "executable nie może być symlinkiem i musi być zwykłym plikiem".into(),
+        ));
+    }
+    if metadata.permissions().mode() & 0o022 != 0 {
+        return Err(HostError::UnsafeExecutable(
+            "executable jest zapisywalny przez grupę lub innych użytkowników".into(),
+        ));
+    }
+    let hash = file_sha256(&path)?;
+    Ok((path, hash))
+}
+
+fn file_sha256(path: &Path) -> Result<String, HostError> {
+    let mut file =
+        File::open(path).map_err(|error| HostError::UnsafeExecutable(error.to_string()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| HostError::UnsafeExecutable(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    let digest = digest.finalize();
+    Ok(format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+fn launch_spec_hash(record: &PluginRegistrationRecord) -> Result<String, HostError> {
+    let canonical = (
+        &record.plugin_id,
+        &record.plugin_version,
+        &record.manifest_hash,
+        &record.command,
+        &record.executable_path,
+        &record.executable_hash,
+        &record.working_dir,
+        &record.environment,
+        record.sandbox_required,
+        &record.sandbox_executable,
+        record.request_timeout_ms,
+        record.max_frame_bytes,
+        record.max_restart_attempts,
+    );
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|error| HostError::StaleLaunchSpec(error.to_string()))?;
     let digest = Sha256::digest(bytes);
     Ok(format!(
         "sha256:{}",
@@ -490,12 +798,14 @@ impl PluginToolExecutor {
         launch_policy: PluginLaunchPolicy,
         audit: Option<Arc<dyn AuditSink>>,
     ) -> Result<Self, HostError> {
+        let launch_policy = normalize_launch_policy(launch_policy)?;
         if command.is_empty() {
             return Err(HostError::Spawn("pusta komenda pluginu".into()));
         }
         local_manifest
             .validate()
             .map_err(|e| HostError::ManifestMismatch(e.to_string()))?;
+        validate_executable(&command)?;
         validate_launch_policy(&launch_policy)?;
         let connection = spawn_and_handshake(&command, &local_manifest, &launch_policy).await?;
         let tool_id = local_manifest.descriptor.id.clone();
@@ -508,9 +818,9 @@ impl PluginToolExecutor {
             local_manifest: Arc::new(local_manifest),
             command: Arc::new(command),
             connection: Arc::new(Mutex::new(connection)),
-            request_timeout_ms,
+            request_timeout_ms: request_timeout_ms.min(launch_policy.request_timeout_ms),
             restart_attempts: Arc::new(Mutex::new(0)),
-            max_restart_attempts: DEFAULT_MAX_RESTART_ATTEMPTS,
+            max_restart_attempts: launch_policy.max_restart_attempts,
             audit,
             launch_policy,
         })
@@ -616,6 +926,7 @@ async fn spawn_and_handshake(
         child,
         stdin: BufWriter::new(stdin),
         stdout: BufReader::new(stdout),
+        max_frame_bytes: launch_policy.max_frame_bytes,
     };
     let hello = match connection.receive(DEFAULT_HEARTBEAT_TIMEOUT_MS).await {
         Ok(message) => message,
@@ -648,17 +959,62 @@ async fn spawn_and_handshake(
 
 fn validate_launch_policy(policy: &PluginLaunchPolicy) -> Result<(), HostError> {
     if policy.environment.keys().any(|key| {
-        key.is_empty() || key.contains('=') || key.starts_with("LD_") || key.contains("PROXY")
+        let upper = key.to_ascii_uppercase();
+        key.is_empty()
+            || key.contains('=')
+            || upper.starts_with("LD_")
+            || upper.contains("PROXY")
+            || [
+                "SECRET",
+                "TOKEN",
+                "PASSWORD",
+                "CREDENTIAL",
+                "PRIVATE_KEY",
+                "AUTH",
+            ]
+            .iter()
+            .any(|word| upper.contains(word))
     }) {
         return Err(HostError::InvalidLaunchPolicy(
             "środowisko pluginu zawiera niedozwoloną nazwę".into(),
         ));
     }
-    if let Some(dir) = &policy.working_dir {
-        if !dir.is_dir() {
-            return Err(HostError::InvalidLaunchPolicy(
-                "katalog roboczy pluginu nie istnieje".into(),
-            ));
+    let dir = policy
+        .working_dir
+        .as_ref()
+        .ok_or_else(|| HostError::InvalidLaunchPolicy("katalog roboczy musi być jawny".into()))?;
+    if !dir.is_absolute() {
+        return Err(HostError::InvalidLaunchPolicy(
+            "katalog roboczy musi być absolutny".into(),
+        ));
+    }
+    let metadata = fs::symlink_metadata(dir).map_err(|_| {
+        HostError::InvalidLaunchPolicy("katalog roboczy pluginu nie istnieje".into())
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(HostError::InvalidLaunchPolicy(
+            "katalog roboczy nie może być symlinkiem i musi być katalogiem".into(),
+        ));
+    }
+    if policy.request_timeout_ms == 0 || policy.request_timeout_ms > DEFAULT_REQUEST_TIMEOUT_MS {
+        return Err(HostError::InvalidLaunchPolicy(
+            "timeout pluginu jest poza dozwolonym zakresem".into(),
+        ));
+    }
+    if policy.max_frame_bytes == 0 || policy.max_frame_bytes > MAX_FRAME_BYTES {
+        return Err(HostError::InvalidLaunchPolicy(
+            "limit ramki pluginu jest poza dozwolonym zakresem".into(),
+        ));
+    }
+    if policy.max_restart_attempts > 8 {
+        return Err(HostError::InvalidLaunchPolicy(
+            "limit restartów pluginu jest zbyt wysoki".into(),
+        ));
+    }
+    if let Some(sandbox) = &policy.sandbox_executable {
+        let metadata = fs::symlink_metadata(sandbox).map_err(|_| HostError::SandboxUnavailable)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(HostError::SandboxUnavailable);
         }
     }
     Ok(())

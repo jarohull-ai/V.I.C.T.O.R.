@@ -111,22 +111,29 @@ pub enum ContractError {
 }
 
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, ContractError> {
+    encode_with_limit(message, MAX_FRAME_BYTES)
+}
+
+pub fn encode_with_limit(
+    message: &WireMessage,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ContractError> {
     let mut bytes =
         serde_json::to_vec(message).map_err(|e| ContractError::InvalidJson(e.to_string()))?;
-    if bytes.len() + 1 > MAX_FRAME_BYTES {
-        return Err(ContractError::FrameTooLarge {
-            limit: MAX_FRAME_BYTES,
-        });
+    if bytes.len() + 1 > max_bytes {
+        return Err(ContractError::FrameTooLarge { limit: max_bytes });
     }
     bytes.push(b'\n');
     Ok(bytes)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<WireMessage, ContractError> {
-    if bytes.len() > MAX_FRAME_BYTES {
-        return Err(ContractError::FrameTooLarge {
-            limit: MAX_FRAME_BYTES,
-        });
+    decode_with_limit(bytes, MAX_FRAME_BYTES)
+}
+
+pub fn decode_with_limit(bytes: &[u8], max_bytes: usize) -> Result<WireMessage, ContractError> {
+    if bytes.len() > max_bytes {
+        return Err(ContractError::FrameTooLarge { limit: max_bytes });
     }
     serde_json::from_slice(bytes).map_err(|e| ContractError::InvalidJson(e.to_string()))
 }
@@ -134,10 +141,17 @@ pub fn decode(bytes: &[u8]) -> Result<WireMessage, ContractError> {
 /// Dekoduje kompletną ramkę transportową. Delimiter jest częścią kontraktu;
 /// wywołujący nie może przekazać niekompletnego fragmentu JSON.
 pub fn decode_frame(bytes: &[u8]) -> Result<WireMessage, ContractError> {
+    decode_frame_with_limit(bytes, MAX_FRAME_BYTES)
+}
+
+pub fn decode_frame_with_limit(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<WireMessage, ContractError> {
     if bytes.last() != Some(&b'\n') {
         return Err(ContractError::MissingFrameDelimiter);
     }
-    decode(&bytes[..bytes.len() - 1])
+    decode_with_limit(&bytes[..bytes.len() - 1], max_bytes)
 }
 
 #[cfg(test)]
