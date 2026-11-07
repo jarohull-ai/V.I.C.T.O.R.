@@ -1,7 +1,7 @@
 # V.I.C.T.O.R. v0.1.0-rc.2
 
-Status: kandydat przygotowany do akceptacji właściciela. Taga ani GitHub
-Release nie utworzono i nie wypchnięto.
+Status: istniejący kandydat do pre-release; GitHub Release nie utworzono ani nie
+wypchnięto.
 
 ## Zweryfikowany target
 
@@ -11,9 +11,8 @@ Release nie utworzono i nie wypchnięto.
   (trwałe idempotency) i `86dc4d0` (weryfikacja taga rc.1);
 - istniejący tag `v0.1.0-rc.1` pozostaje bez zmian i wskazuje:
   `cd4a326ddeba8cba5fbb51192be3f89575620ced`;
-- proponowany `v0.1.0-rc.2` ma wskazywać zweryfikowany commit kodu
-  `86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`; dokumentacja RC2 pozostaje
-  osobnym commitem przygotowawczym.
+- istniejący `v0.1.0-rc.2` wskazuje dokładnie zweryfikowany commit kodu
+  `86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`; taga nie zmieniano.
 
 ## Zakres rc.2
 
@@ -52,6 +51,7 @@ python3 scripts/local/test_install.py                        OK
 python3 scripts/ci/check_repo.py                              OK
 git diff --check                                                OK
 sha256sum -c target/release/SHA256SUMS                         OK
+python3 scripts/local/test_trusted_definitions.py             OK
 ```
 
 ## Artefakty
@@ -78,14 +78,32 @@ Trusted definitions pozostają placeholderami do ręcznego uzupełnienia i
 zweryfikowania. Whisper.cpp, lokalny model, TTS oraz bubblewrap są wymaganiami
 operatora; instalator ich nie pobiera.
 
-## Przygotowanie taga po akceptacji właściciela
+## Stan taga i publikacji
 
-Nie wykonano tej komendy:
+Tag już istnieje i został zweryfikowany:
 
 ```sh
-git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
-git push origin v0.1.0-rc.2
+git rev-parse refs/tags/v0.1.0-rc.2^{commit}
+# 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
 ```
 
 Po utworzeniu taga push i GitHub Release wymagają osobnej, wyraźnej decyzji
 właściciela. Nie używać force push i nie zmieniać `v0.1.0-rc.1`.
+
+## Walidacja operatora i realnych executable
+
+Walidator jest tylko do odczytu; nie zmienia trusted definitions, nie uruchamia
+procesów i nie wypisuje wartości środowiska:
+
+```sh
+python3 scripts/local/validate_trusted.py validate \
+  --directory "${XDG_CONFIG_HOME:-$HOME/.config}/victor/trusted"
+python3 scripts/local/validate_trusted.py hash /absolute/path/to/whisper-cli
+```
+
+Daemon ponownie sprawdza te same granice przy starcie. Dla brakujących
+whisper-cli/modelu/TTS wynik operacyjnego testu brzmi `NotConfigured`; projekt
+nie pobiera modeli ani nie używa fallbacku sieciowego. W tej weryfikacji
+`/usr/bin/bwrap` jest dostępny, ale lokalne whisper-cli, model i silnik TTS nie
+zostały znalezione, więc realny test audio kończy się jawnie jako
+`NotConfigured`. Fixture smoke test pozostaje niezależny od sieci.

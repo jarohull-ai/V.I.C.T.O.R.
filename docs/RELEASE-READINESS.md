@@ -16,6 +16,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all --check
 git diff --check
 python3 scripts/local/test_install.py
+python3 scripts/local/test_trusted_definitions.py
 python3 scripts/local/sha256_manifest.py --output target/release/SHA256SUMS \
   target/release/victor-daemon target/release/victor-skill
 sha256sum target/release/victor-daemon target/release/victor-skill
@@ -99,3 +100,13 @@ Nie tworzyć taga ani GitHub Release automatycznie.
 Manifest sum jest deterministyczny, sortowany po nazwie artefaktu i odrzuca
 symlinki. Generuj go dopiero po zakończeniu builda release; nie umieszczaj w nim
 tokenów, trusted definitions ani plików konfiguracyjnych zawierających sekrety.
+
+Walidacja realnych komponentów jest jawna i tylko do odczytu:
+
+```sh
+python3 scripts/local/validate_trusted.py validate \
+  --directory "${XDG_CONFIG_HOME:-$HOME/.config}/victor/trusted"
+```
+
+Brak whisper-cli, modelu lub lokalnego TTS oznacza `NotConfigured`; nie wolno
+udawać testu produkcyjnego, pobierać modeli ani używać chmurowego fallbacku.
