@@ -1,0 +1,25 @@
+[package]
+name = "bse-fetch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "BALD HTTP fetcher: SSRF policy, redirects, extraction and local cache"
+readme = "README.md"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+encoding_rs = "0.8"
+hex = "0.4"
+ipnet = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "stream", "gzip", "brotli", "deflate"] }
+robotstxt = "0.3"
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net", "fs", "signal"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

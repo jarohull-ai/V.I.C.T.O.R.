@@ -108,6 +108,12 @@ treści. bse-fetch egzekwuje SSRF, timeout, rozmiar, robots i ponowną walidacj�
 każdego redirectu; dodatkowa allowlista hostów jest sprawdzana przed każdym
 hopem, aby redirect nie mógł wyjść poza zgodę użytkownika.
 
+Na granicy repozytoriów używamy vendoringu: `vendor/bse-fetch` jest
+samowystarczalnym snapshotem potrzebnego crate'a z zachowaną licencją MIT.
+Manifest V.I.C.T.O.R. nie wskazuje lokalnego checkoutu BALD ani repozytorium
+Git BALD, a `vendor/bse-fetch/Cargo.toml` nie dziedziczy konfiguracji BALD.
+`vendor/bse-fetch/ORIGIN.md` dokumentuje pochodzenie snapshotu.
+
 ### Skills deklaratywne
 
 `victor-skills` jest właścicielem manifestu skill, jego wersji, hasha,
@@ -183,10 +189,9 @@ aktywację wersji przywróconej przez rollback.
 
 ## Otwarte punkty P0
 
-0. Zacommitować i opublikować w BALD zmianę `bse-fetch`, która egzekwuje
-   allowlistę hostów na każdym redirect hopie, a następnie zastąpić tymczasowy
-   `path` dependency przypiętym `git` revision. Bez tego niezależny build
-   V.I.C.T.O.R. nie jest jeszcze reprodukowalny.
+0. Ustalić procedurę aktualizacji vendored `bse-fetch` z BALD upstream. Nie jest
+   to zależność builda: V.I.C.T.O.R. buduje się z własnego snapshotu i nie
+   wymaga checkoutu ani repozytorium BALD.
 1. Pisemna zgoda na JFP Box v0.2 (PolyForm NC) albo zastąpienie go własnym
    walidatorem manifestu.
 2. Decyzja: `viper-boxd` czy Rust Lab jako jedyny backend izolacji.

@@ -139,7 +139,6 @@ dependencies = [
 [[package]]
 name = "bse-fetch"
 version = "0.1.0"
-source = "git+https://github.com/jarohull-ai/BALD-ENGINE.git?rev=8bc13b9#8bc13b95f96a3eca27ceb6b4b845afacf9a29ebb"
 dependencies = [
  "chrono",
  "encoding_rs",
@@ -151,6 +150,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "thiserror",
  "tokio",
  "url",

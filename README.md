@@ -16,6 +16,7 @@ Tauri, egui i w testach.
 | `crates/victor-tools` | Registry manifestów, wersjonowanie, deklaratywne JSON Schema wejścia/wyjścia, kontrakt `ToolExecutor` i strukturalny `AuditSink` |
 | `crates/victor-runtime` | Runtime STT i narzędzi: policy → approval → executor → wynik → context/audit |
 | `crates/victor-fetch-bald` | Osobny adapter BALD dla read-only `web.fetch`; allowlista hostów na każdym redirect hopie, SSRF, limity i provenance evidence |
+| `vendor/bse-fetch` | Samowystarczalna, MIT-licensed kopia potrzebnego crate'a fetch; brak zależności Cargo od checkoutu lub Git BALD |
 | `crates/victor-storage` | SQLite `ContextStore` z kluczem `(scope_type, scope_id, item_id)`, indeksami scope/tier/czasu, purge i atomowym commit context+audit |
 | `crates/victor-skills` | Deklaratywne manifesty skills: hash, JSON Schema, workflow z registry narzędzi, lifecycle, zależności i rollback |
 | `crates/victor-skill-forge` | Bezpieczny forge opisu/recipe do Draft, dry-run, policy validation i Active; bez kodu i bez nowych capabilities |
@@ -176,13 +177,10 @@ cargo fmt --all --check
 
 ## Czego jeszcze nie ma
 
-- Niezależnego, przypiętego commita `bse-fetch` w repozytorium BALD. Obecny
-  adapter wymaga `allowed_hosts` egzekwowanego na każdym redirect hopie; ta
-  zmiana istnieje obecnie tylko w niezacommitowanym checkoutcie BALD. Do czasu
-  zatwierdzenia jej upstream nie zamieniamy jej na słabszą walidację URL-u
-  początkowego.
-- Czystego buildu V.I.C.T.O.R. bez checkoutu BALD obok workspace — pozostaje
-  to jedynym aktywnym blockerem integracyjnym.
+- Synchronizacji zmian `bse-fetch` z BALD upstream. V.I.C.T.O.R. używa
+  świadomie vendored snapshotu w `vendor/bse-fetch`, z zachowaną licencją MIT i
+  własnym `ORIGIN.md`; aktualizacja wymaga osobnego audytu i osobnego commita
+  wyłącznie w V.I.C.T.O.R.
 - Indeksu semantycznego i `apps/`.
 - Migracji schematu SQLite poza pierwszą migracją bazową — obecny storage ma
   trwały schemat kontekstu i audytu oraz odtwarzanie po restarcie.
