@@ -100,6 +100,7 @@ pub enum PluginOperation {
     Unregister {
         plugin_id: ToolId,
         explicit_decision: bool,
+        approval: Option<Approval>,
         actor: String,
         reason: String,
         at_unix_ms: u64,
@@ -493,10 +494,18 @@ async fn dispatch_plugin(
         PluginOperation::Unregister {
             plugin_id,
             explicit_decision,
+            approval,
             actor,
             reason,
             at_unix_ms,
-        } => plugin_value(api.unregister(&plugin_id, explicit_decision, actor, reason, at_unix_ms)),
+        } => plugin_value(api.unregister(
+            &plugin_id,
+            explicit_decision,
+            approval,
+            actor,
+            reason,
+            at_unix_ms,
+        )),
         PluginOperation::AuditHistory { plugin_id } => {
             plugin_value(api.audit_history(plugin_id.as_ref()))
         }

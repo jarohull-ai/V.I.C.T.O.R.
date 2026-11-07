@@ -185,6 +185,7 @@ fn build_plugin_operation(args: &[String]) -> Result<PluginOperation, String> {
         "unregister" => Ok(PluginOperation::Unregister {
             plugin_id: plugin_id(rest, 0)?,
             explicit_decision: has_flag(rest, "--confirm"),
+            approval: approval_arg(rest)?,
             actor: named_arg(rest, "--actor").unwrap_or_else(|| "cli-user".into()),
             reason: named_arg(rest, "--reason").unwrap_or_else(|| "CLI decision".into()),
             at_unix_ms: at_arg(rest)?,

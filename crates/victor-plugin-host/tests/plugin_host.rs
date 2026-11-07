@@ -7,7 +7,8 @@ use tempfile::tempdir;
 use victor_context::{ContextItemId, ContextScope, ContextStore, InMemoryContextStore};
 use victor_domain::{Plan, PlanStep, RiskLevel, ToolDescriptor, ToolId};
 use victor_plugin_host::{
-    HostError, PersistentPluginHost, PluginLaunchPolicy, PluginToolExecutor, SandboxRequirement,
+    HostError, PersistentPluginHost, PluginLaunchPolicy, PluginLaunchRequest, PluginLifecycleApi,
+    PluginToolExecutor, SandboxRequirement,
 };
 use victor_policy::{PolicyConfig, PolicyEngine};
 use victor_runtime::{ToolExecutionJob, ToolRuntime};
@@ -435,6 +436,67 @@ async fn registration_is_idempotent_but_manifest_conflicts_are_rejected() {
         .await,
         Err(HostError::RegistrationConflict(_))
     ));
+}
+
+#[tokio::test]
+async fn lifecycle_api_uses_trusted_definition_and_hides_launch_details() {
+    let database = Arc::new(SqliteContextStore::in_memory().unwrap());
+    let root = tempdir().unwrap();
+    let id = ToolId::parse("plugin_sysinfo").unwrap();
+    let policy = Arc::new(
+        PolicyEngine::new(
+            PolicyConfig::new([root.path().to_path_buf()]).with_enabled_tools([id.clone()]),
+        )
+        .unwrap(),
+    );
+    let api = PluginLifecycleApi::open(database, policy, None)
+        .await
+        .unwrap()
+        .with_plugin_definition(
+            manifest(),
+            fixture("normal", None),
+            PluginLaunchPolicy::default(),
+        )
+        .unwrap();
+    let mut api = api;
+    let launch = PluginLaunchRequest {
+        command: fixture("normal", None),
+        working_dir: std::env::current_dir().unwrap().display().to_string(),
+        environment: BTreeMap::new(),
+        sandbox: SandboxRequirement::NotRequired,
+        sandbox_executable: None,
+        request_timeout_ms: 30_000,
+        max_frame_bytes: 256 * 1024,
+        max_restart_attempts: 1,
+    };
+    let summary = api
+        .register(
+            manifest(),
+            launch,
+            None,
+            "test".into(),
+            "register".into(),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(summary.status, "active");
+    let review = api.review(&id).unwrap();
+    assert!(review.launch_spec_verified);
+    assert!(review.environment_keys.is_empty());
+    assert_eq!(review.argument_count, 1);
+    api.disable(&id, "test".into(), "disable".into(), 2)
+        .unwrap();
+    api.activate(&id, None, "test".into(), "activate".into(), 3)
+        .await
+        .unwrap();
+    api.restart(&id, None, "test".into(), "restart".into(), 4)
+        .await
+        .unwrap();
+    assert_eq!(api.audit_history(Some(&id)).unwrap().len(), 4);
+    api.unregister(&id, true, None, "test".into(), "remove".into(), 5)
+        .unwrap();
+    assert!(api.list().unwrap().is_empty());
 }
 
 #[tokio::test]

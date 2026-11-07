@@ -768,8 +768,7 @@ impl PluginLifecycleApi {
 
     pub fn review(&self, id: &ToolId) -> Result<PluginReview, HostError> {
         let record = self.record(id)?;
-        let launch_spec_verified =
-            record.status == "disabled" || self.verify_record(&record).is_ok();
+        let launch_spec_verified = self.verify_record(&record).is_ok();
         let executable_name = Path::new(&record.executable_path)
             .file_name()
             .and_then(|name| name.to_str())
@@ -888,6 +887,7 @@ impl PluginLifecycleApi {
         &mut self,
         id: &ToolId,
         explicit_decision: bool,
+        approval: Option<Approval>,
         actor: String,
         reason: String,
         at_unix_ms: u64,
@@ -897,6 +897,8 @@ impl PluginLifecycleApi {
                 "unregister wymaga jawnej decyzji użytkownika".into(),
             ));
         }
+        let manifest = self.manifest(id)?;
+        self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
         self.host.unregister(id, true)?;
         self.record_decision(id, "unregister", "removed", actor, reason, at_unix_ms)?;
         Ok(serde_json::json!({"plugin_id": id, "status": "removed"}))
