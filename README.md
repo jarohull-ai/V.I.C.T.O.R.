@@ -56,6 +56,13 @@ EOF i crash kończą stdin/stdout przez `kill` + `wait`, a restart jest limitowa
 konfiguracją. Adapter nie ma klienta sieciowego i nigdy nie przełącza się
 automatycznie na chmurę.
 
+Daemon ładuje model wyłącznie z server-side pliku `local-model.json` w katalogu
+trusted definitions. Plik zawiera absolutną komendę, jawny working directory,
+allowlistę środowiska, limity, timeout, restart policy, wymaganie sandboxa oraz
+hash konfiguracji i executable. Klient CLI/UI nie może zmienić tych wartości;
+brak pliku, zmiana hashy, symlink executable lub niebezpieczne uprawnienia
+kończą start daemona.
+
 ## Granica pluginów
 
 Zewnętrzne narzędzia działają jako ograniczone procesy potomne przez

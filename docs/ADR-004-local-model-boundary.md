@@ -27,6 +27,17 @@ Fixture testowy nie jest prawdziwym modelem. Testuje handshake, odpowiedź,
 plan, zły JSON, próbę prompt injection i timeout; produkcyjny model musi
 implementować dokładnie ten sam kontrakt.
 
+## Konfiguracja produkcyjna
+
+Daemon czyta `local-model.json` wyłącznie z server-side katalogu trusted
+definitions. Konfiguracja zawiera absolutne `command`, `working_dir`, jawne
+`environment`, limity, timeout, liczbę restartów, wymaganie sandboxa oraz
+`executable_sha256` i `config_sha256`. Przed startem daemon sprawdza właściciela
+i uprawnienia pliku, hash konfiguracji, hash executable, working directory oraz
+odrzuca nazwy zmiennych sugerujące sekrety. Klient rozmowy nie ma ścieżki do
+zmiany tej konfiguracji. Brak pliku lub rozbieżność hashy kończy start
+fail-closed; nie ma cichego backendu zastępczego.
+
 ## Konsekwencje
 
 Lokalny model może proponować plan, ale nigdy nie może sam nadać sobie dostępu.

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 libc.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -13,12 +14,14 @@ tokio.workspace = true
 victor-domain = { path = "../victor-domain" }
 victor-conversation = { path = "../victor-conversation" }
 victor-plugin-host = { path = "../victor-plugin-host" }
+victor-plugin-contract = { path = "../victor-plugin-contract" }
 victor-policy = { path = "../victor-policy" }
 victor-skill-api = { path = "../victor-skill-api" }
 victor-skill-transport = { path = "../victor-skill-transport" }
 victor-storage = { path = "../victor-storage" }
 victor-tools = { path = "../victor-tools" }
 victor-runtime = { path = "../victor-runtime" }
+victor-model-local = { path = "../victor-model-local" }
 
 [dev-dependencies]
 tempfile.workspace = true
