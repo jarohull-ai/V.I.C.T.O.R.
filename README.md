@@ -111,6 +111,27 @@ restarcie jest świadomie wpisana do release readiness.
 
 ## Uruchomienie
 
+### Lokalna instalacja bez sudo
+
+Po zbudowaniu release można użyć instalatora użytkownika. Wymaga on
+`XDG_RUNTIME_DIR` i nie korzysta ze wspólnego `/tmp`:
+
+```sh
+cargo build --release --workspace --all-features --locked
+python3 scripts/local/install.py install --release-dir target/release
+python3 scripts/local/test_install.py
+```
+
+Trusted definitions są tworzone jako placeholdery i muszą zostać ręcznie
+uzupełnione oraz zweryfikowane przed startem daemona. Instalator tworzy katalogi
+0700, token 0600, odrzuca symlinki/obcego właściciela/złe uprawnienia i zachowuje
+konfigurację oraz SQLite przy odinstalowaniu. Opcjonalny unit user-level można
+wygenerować przez `--systemd-user`; nie jest automatycznie aktywowany i nie
+udaje sandboxa komponentów.
+
+Pełna procedura oraz checklista RC są w
+[`docs/RELEASE-READINESS.md`](docs/RELEASE-READINESS.md).
+
 ```sh
 cargo test --workspace
 cargo test -p victor-stt-cloud --no-default-features

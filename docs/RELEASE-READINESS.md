@@ -1,0 +1,80 @@
+# V.I.C.T.O.R. — release readiness
+
+## Clean checkout gate
+
+Uruchamiane z katalogu repozytorium, bez zależności od innych checkoutów:
+
+```sh
+python3 scripts/ci/check_repo.py
+cargo build --release --workspace --all-features --locked
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo fmt --all --check
+git diff --check
+python3 scripts/local/test_install.py
+sha256sum target/release/victor-daemon target/release/victor-skill
+```
+
+Instalator testowy działa wyłącznie w `tempfile.TemporaryDirectory`, nie używa
+sudo, nie aktywuje usług i nie modyfikuje katalogów użytkownika.
+
+## Instalacja lokalna
+
+Po zbudowaniu release:
+
+```sh
+python3 scripts/local/install.py install --release-dir target/release
+```
+
+Wymagane jest ustawione `XDG_RUNTIME_DIR`; projekt celowo nie używa wspólnego
+`/tmp`. Domyślne lokalizacje to:
+
+- `XDG_CONFIG_HOME/victor/trusted` — trusted definitions i token 0600;
+- `XDG_STATE_HOME/victor/state.sqlite` — stan SQLite;
+- `XDG_RUNTIME_DIR/victor` — prywatny socket i katalog 0700;
+- `XDG_DATA_HOME/victor/bin` — binaria release.
+
+Brakujące katalogi są tworzone z trybem 0700. Istniejące symlinki, obcy
+właściciel, pliki zamiast katalogów i uprawnienia grupy/innych kończą instalację
+odmową. Instalator nie nadpisuje tokena ani istniejących trusted definitions.
+Pliki `.json` są bezpiecznymi placeholderami: przed startem trzeba podać
+zweryfikowane ścieżki executable/modeli i ich hashe. Nie wolno wpisywać sekretów
+do definicji ani środowiska procesu.
+
+Odinstalowanie usuwa tylko binaria z katalogu instalacji:
+
+```sh
+python3 scripts/local/install.py uninstall
+```
+
+Konfiguracja, token i SQLite są zachowywane. Usuwanie danych jest osobną,
+świadomą czynnością użytkownika.
+
+## User-level systemd
+
+Opcjonalnie można wygenerować unit bez roota:
+
+```sh
+python3 scripts/local/install.py install --release-dir target/release --systemd-user
+systemctl --user daemon-reload
+systemctl --user enable --now victor.service
+```
+
+Instalator nie włącza usługi automatycznie. Unit używa `NoNewPrivileges`,
+`PrivateTmp`, `ProtectSystem=strict`, `ProtectHome=read-only` i ograniczonych
+`ReadWritePaths`. To nie zastępuje sandboxa pluginu/modelu/STT/TTS: jeśli trusted
+definition wymaga bubblewrap, `/usr/bin/bwrap` musi istnieć i być osobno
+zweryfikowany przez daemon. Whisper.cpp, lokalny model i TTS są wymaganiami
+operatora; instalator ich nie pobiera i nie uruchamia.
+
+## Release checklist
+
+- [ ] wersja workspace i `Cargo.lock` są zgodne i zapisane w commicie;
+- [ ] root `LICENSE` pozostaje BUSL-1.1;
+- [ ] `vendor/bse-fetch` zachowuje MIT, `LICENSE` i `ORIGIN.md`;
+- [ ] `scripts/ci/check_repo.py` nie wykrywa path dependency poza workspace;
+- [ ] brak sekretów, tokenów i ścieżek do innych checkoutów;
+- [ ] pełny gate clean-checkout przechodzi;
+- [ ] binaria i konfiguracje release mają opublikowane SHA-256;
+- [ ] smoke test voice przechodzi na fixture bez sieci;
+- [ ] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
