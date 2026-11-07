@@ -26,7 +26,7 @@ use victor_runtime::{SttJob, SttRuntime, ToolRuntime};
 use victor_skill_api::SkillApi;
 use victor_skill_transport::{UnixSkillServer, VoiceService};
 use victor_storage::SqliteContextStore;
-use victor_tools::{ToolManifest, ToolRegistry};
+use victor_tools::{AuditOutcome, AuditSink, ToolAuditEvent, ToolManifest, ToolRegistry};
 use victor_tts_local::{LocalTts, LocalTtsConfig};
 
 const DEFAULT_SCOPE: &str = "local";
@@ -188,6 +188,7 @@ struct DaemonVoiceService {
     stt: SttRuntime<WhisperCppSpeechToText>,
     conversation: Arc<dyn ConversationService>,
     tts: Option<Arc<LocalTts>>,
+    audit: Arc<dyn AuditSink>,
 }
 
 #[async_trait]
@@ -224,7 +225,7 @@ impl VoiceService for DaemonVoiceService {
         let reply = self
             .conversation
             .chat(
-                conversation_id,
+                conversation_id.clone(),
                 scope,
                 outcome.transcript.text.clone(),
                 at_unix_ms,
@@ -255,6 +256,28 @@ impl VoiceService for DaemonVoiceService {
         } else {
             serde_json::json!({"status": "disabled"})
         };
+        let tts_status = tts
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error");
+        let audit_outcome = match tts_status {
+            "synthesized" => AuditOutcome::Succeeded,
+            "disabled" => AuditOutcome::Denied,
+            _ => AuditOutcome::Failed,
+        };
+        let audit_tool = ToolId::parse("tts.local").map_err(|e| e.to_string())?;
+        self.audit
+            .record(ToolAuditEvent {
+                task_id: format!("voice:{conversation_id}"),
+                tool: audit_tool,
+                tool_version: "1".into(),
+                plan_hash: format!("audio:{audio_hash}"),
+                started_at_unix_ms: at_unix_ms,
+                finished_at_unix_ms: at_unix_ms,
+                outcome: audit_outcome,
+                summary: format!("local TTS: {tts_status}"),
+            })
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({
             "transcript": outcome.transcript.text,
             "provider": outcome.transcript.provider,
@@ -404,6 +427,7 @@ impl Daemon {
                 .transpose()
                 .map_err(|e| DaemonError::Config(e.to_string()))?
                 .map(Arc::new),
+            audit: store.clone(),
         });
         let server = UnixSkillServer::new(&config.socket_path, token, &config.scope, skill_api)
             .map_err(|e| DaemonError::Transport(e.to_string()))?
