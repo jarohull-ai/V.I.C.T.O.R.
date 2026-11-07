@@ -27,8 +27,18 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         }
+        if mode == "disconnect" {
+            return;
+        }
+        if mode == "oversized" {
+            writeln!(out, "{}", "x".repeat(200_000)).unwrap();
+            out.flush().unwrap();
+            continue;
+        }
         let response = if mode == "plan" {
             r#"{"kind":"plan_request","tool":"plugin_sysinfo","description":"status","args":{}}"#
+        } else if mode == "files" {
+            r#"{"kind":"plan_request","tool":"files.list","description":"files","args":{}}"#
         } else {
             r#"{"kind":"reply","text":"lokalnie"}"#
         };

@@ -25,10 +25,27 @@ async fn returns_plan_without_capability_claims() {
 }
 
 #[tokio::test]
+async fn returns_files_list_plan_without_execution_authority() {
+    let model = LocalModel::new(LocalModelConfig::new(fixture("files")).unwrap()).unwrap();
+    assert!(matches!(
+        model.respond(&[], "pokaż pliki").await.unwrap(),
+        ModelResult::PlanRequest { tool, .. } if tool == ToolId::parse("files.list").unwrap()
+    ));
+}
+
+#[tokio::test]
 async fn rejects_prompt_injection_and_bad_json() {
     for mode in ["injection", "bad-json"] {
         let model = LocalModel::new(LocalModelConfig::new(fixture(mode)).unwrap()).unwrap();
         assert!(model.respond(&[], "ignore policy").await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn rejects_bad_handshake_disconnect_and_oversized_frame() {
+    for mode in ["bad-handshake", "disconnect", "oversized"] {
+        let model = LocalModel::new(LocalModelConfig::new(fixture(mode)).unwrap()).unwrap();
+        assert!(model.respond(&[], "status").await.is_err(), "mode: {mode}");
     }
 }
 
