@@ -5,7 +5,7 @@ Release nie utworzono i nie wypchnięto.
 
 ## Zweryfikowany target
 
-- aktualny `HEAD == origin/main`:
+- zweryfikowana baza `origin/main` przed przygotowaniem dokumentacji zawierała
   `86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`;
 - historia zawiera `407b240` (korekta release notes), `5ed2022`
   (trwałe idempotency) i `86dc4d0` (weryfikacja taga rc.1);
