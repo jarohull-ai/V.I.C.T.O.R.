@@ -27,9 +27,25 @@ fn main() {
         let _ = out.flush();
         return;
     }
+    if mode == "forbidden-risk" {
+        let _ = out.write_all(br#"{"kind":"hello","payload":{"manifest":{"protocol_version":1,"plugin_id":"plugin_sysinfo","plugin_version":"1.0.0","tools":[{"id":"plugin_sysinfo","schema_version":1,"input_schema":{"type":"object"},"output_schema":{"type":"object"},"risk":"r3"}]}}}
+"#);
+        let _ = out.flush();
+        return;
+    }
     if mode == "oversized" {
         let _ = out.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]);
         let _ = out.write_all(b"\n");
+        let _ = out.flush();
+        return;
+    }
+    if mode == "oversized-no-newline" {
+        let _ = out.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]);
+        let _ = out.flush();
+        return;
+    }
+    if mode == "malformed" {
+        let _ = out.write_all(b"{not-json}\n");
         let _ = out.flush();
         return;
     }
@@ -46,6 +62,11 @@ fn main() {
     };
     write_message(&mut out, WireMessage::Hello(Hello { manifest }));
     let marker = std::env::args().nth(2);
+    if mode == "pid" {
+        if let Some(path) = &marker {
+            let _ = std::fs::write(path, std::process::id().to_string());
+        }
+    }
     for line in io::stdin().lock().lines().map_while(Result::ok) {
         let Ok(message) = serde_json::from_str::<WireMessage>(&line) else {
             continue;
@@ -54,17 +75,45 @@ fn main() {
             WireMessage::HelloAck { .. } if mode == "crash-once" => {
                 if let Some(path) = &marker {
                     if std::fs::metadata(path).is_err() {
-                        let _ = std::fs::write(path, b"crashed");
+                        let _ = std::fs::write(path, format!("{}\n", std::process::id()));
                         return;
                     }
+                    let _ = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut file| {
+                            use std::io::Write;
+                            writeln!(file, "{}", std::process::id())
+                        });
                 }
             }
             WireMessage::Heartbeat { nonce } => {
                 write_message(&mut out, WireMessage::HeartbeatAck { nonce })
             }
             WireMessage::Request(Request { .. }) if mode == "timeout" => {
+                if let Some(path) = &marker {
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut file| {
+                            use std::io::Write;
+                            writeln!(file, "{}", std::process::id())
+                        });
+                }
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
+            WireMessage::Request(Request { request_id, .. }) if mode == "env" => write_message(
+                &mut out,
+                WireMessage::Response(Response {
+                    request_id,
+                    output: serde_json::json!({
+                        "secret_present": std::env::var("VICTOR_TEST_SECRET").is_ok()
+                    }),
+                    summary: "environment checked".into(),
+                    finished_at_unix_ms: 2,
+                }),
+            ),
             WireMessage::Request(Request { request_id, .. }) => write_message(
                 &mut out,
                 WireMessage::Response(Response {

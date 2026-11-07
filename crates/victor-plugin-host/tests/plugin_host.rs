@@ -4,7 +4,7 @@ use serde_json::json;
 use tempfile::tempdir;
 use victor_context::{ContextItemId, ContextScope, InMemoryContextStore};
 use victor_domain::{Plan, PlanStep, RiskLevel, ToolDescriptor, ToolId};
-use victor_plugin_host::{HostError, PluginToolExecutor};
+use victor_plugin_host::{HostError, PluginLaunchPolicy, PluginToolExecutor, SandboxRequirement};
 use victor_policy::{PolicyConfig, PolicyEngine};
 use victor_runtime::{ToolExecutionJob, ToolRuntime};
 use victor_tools::{AuditSink, ToolAuditEvent, ToolManifest, ToolRegistry};
@@ -107,7 +107,19 @@ async fn rejects_bad_handshake_and_oversized_frame() {
         Err(HostError::FrameTooLarge)
     ));
     assert!(matches!(
+        PluginToolExecutor::spawn(fixture("oversized-no-newline", None), manifest()).await,
+        Err(HostError::FrameTooLarge)
+    ));
+    assert!(matches!(
+        PluginToolExecutor::spawn(fixture("malformed", None), manifest()).await,
+        Err(HostError::Handshake(_))
+    ));
+    assert!(matches!(
         PluginToolExecutor::spawn(fixture("forbidden-capability", None), manifest()).await,
+        Err(HostError::Handshake(_))
+    ));
+    assert!(matches!(
+        PluginToolExecutor::spawn(fixture("forbidden-risk", None), manifest()).await,
         Err(HostError::Handshake(_))
     ));
 }
@@ -116,17 +128,24 @@ async fn rejects_bad_handshake_and_oversized_frame() {
 async fn times_out_and_restarts_once_after_crash() {
     let mut short = manifest();
     short.descriptor.default_timeout_ms = 25;
-    let timeout_executor = PluginToolExecutor::spawn(fixture("timeout", None), short)
-        .await
-        .unwrap();
+    let timeout_marker = tempdir().unwrap();
+    let timeout_pid_file = timeout_marker.path().join("pids");
+    let timeout_executor =
+        PluginToolExecutor::spawn(fixture("timeout", Some(&timeout_pid_file)), short)
+            .await
+            .unwrap();
     let timeout_error = victor_tools::ToolExecutor::execute(&timeout_executor, json!({}), 4)
         .await
         .unwrap_err();
     assert!(timeout_error.to_string().contains("timeout pluginu"));
+    assert_no_recorded_pids_alive(&timeout_pid_file);
     let marker = tempdir().unwrap();
-    let executor = PluginToolExecutor::spawn(
+    let audits = Arc::new(Audits::default());
+    let executor = PluginToolExecutor::spawn_with_policy(
         fixture("crash-once", Some(&marker.path().join("marker"))),
         manifest(),
+        PluginLaunchPolicy::default(),
+        Some(audits.clone()),
     )
     .await
     .unwrap();
@@ -134,4 +153,45 @@ async fn times_out_and_restarts_once_after_crash() {
         .await
         .unwrap();
     assert_eq!(result.output["cpu_percent"], 0.0);
+    assert_eq!(audits.0.lock().unwrap().len(), 1);
+    drop(executor);
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_no_recorded_pids_alive(&marker.path().join("marker"));
+}
+
+#[tokio::test]
+async fn host_clears_secret_environment_and_requires_available_sandbox() {
+    std::env::set_var("VICTOR_TEST_SECRET", "must-not-leak");
+    let executor = PluginToolExecutor::spawn(fixture("env", None), manifest())
+        .await
+        .unwrap();
+    let result = victor_tools::ToolExecutor::execute(&executor, json!({}), 9)
+        .await
+        .unwrap();
+    std::env::remove_var("VICTOR_TEST_SECRET");
+    assert_eq!(result.output["secret_present"], false);
+
+    let policy = PluginLaunchPolicy {
+        sandbox: SandboxRequirement::Required,
+        sandbox_executable: Some("/definitely/missing/bwrap".into()),
+        ..PluginLaunchPolicy::default()
+    };
+    assert!(matches!(
+        PluginToolExecutor::spawn_with_policy(fixture("normal", None), manifest(), policy, None)
+            .await,
+        Err(HostError::SandboxUnavailable)
+    ));
+}
+
+fn assert_no_recorded_pids_alive(path: &std::path::Path) {
+    let content = std::fs::read_to_string(path).unwrap();
+    for pid in content.lines().filter_map(|line| line.parse::<u32>().ok()) {
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "plugin PID {pid} nadal działa");
+    }
 }

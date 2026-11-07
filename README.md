@@ -38,8 +38,16 @@ plików i risk nigdy nie są przyznawane przez plugin: pochodzą z lokalnego
 Pierwszym testem produkcyjnego kształtu jest `plugin_sysinfo` — narzędzie R0,
 które raportuje dane CPU/RAM bez sieci i zapisu. Host używa JSON-over-stdio,
 limitów ramek, timeoutów, heartbeatów i najwyżej jednego kontrolowanego
-restartu po awarii procesu. WASM, biblioteki dynamiczne, proxy HTTP i kod
-generowany pozostają poza tą granicą.
+restartu po awarii procesu. Każdy child dostaje wyczyszczone środowisko oraz
+wyłącznie jawnie przekazane zmienne. `SandboxRequirement::Required` odmawia
+startu bez dostępnego bubblewrap; brak sandboxa nie jest maskowany jako
+izolacja. WASM, biblioteki dynamiczne, proxy HTTP i kod generowany pozostają
+poza tą granicą.
+
+Awaria, timeout, rozłączenie lub błędny framing zamykają stdin/stdout i kończą
+proces przez `kill` + `wait`. Limit ramki działa także przed otrzymaniem newline,
+więc bufor nie rośnie bez ograniczeń. Restart jest limitowany do jednej próby i
+może zapisać zdarzenie `Failed` do `AuditSink`.
 
 ## Uruchomienie
 

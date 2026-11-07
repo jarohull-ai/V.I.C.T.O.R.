@@ -9,6 +9,8 @@ Zaakceptowana.
 Pluginy V.I.C.T.O.R. działają jako osobne procesy uruchamiane przez
 `victor-plugin-host` przez stdin/stdout. `victor-plugin-contract` definiuje
 wersjonowane wiadomości JSON, jedną ramkę na linię, limit rozmiaru i timeouty.
+Host czyta ramki limitowanym readerem: przekroczenie limitu przed newline,
+EOF bez kompletnej ramki i uszkodzony JSON są błędami fail-closed.
 
 Manifest wire opisuje wyłącznie identyfikator pluginu, wersję oraz bindingi
 narzędzi i schematów. Nie może nadawać sobie capabilities, risk, scope ani
@@ -16,9 +18,21 @@ zgody. Te dane pochodzą z lokalnego `victor-tools::ToolManifest` i są oceniane
 przez `victor-policy` w `victor-runtime`.
 
 Host nie udostępnia HTTP, proxy, powłoki ani alternatywnej ścieżki wykonania.
-Awaria procesu kończy wykonanie; host może wykonać najwyżej jeden kontrolowany
-restart. Każde udane wykonanie pozostaje w standardowym przepływie runtime:
+Child startuje z wyczyszczonym środowiskiem, jawny jest katalog roboczy, a
+sekrety i zmienne proxy nie są dziedziczone. Awaria procesu kończy wykonanie;
+host może wykonać najwyżej jeden kontrolowany restart, po uprzednim kill + wait
+starego procesu. Restart może zostać zapisany w `AuditSink`. Każde udane
+wykonanie pozostaje w standardowym przepływie runtime:
 manifest → policy → executor → context + audit.
+
+### Granica sandboxa
+
+`PluginLaunchPolicy` rozróżnia plugin niewymagający izolacji od pluginu, który
+wymaga sandboxa. Dla tego drugiego host używa wykrytego `bubblewrap` (lub jawnie
+wskazanej ścieżki), z `--die-with-parent`, `--clearenv`, `--unshare-net`,
+read-only rootem i tymczasowym `/tmp`. Brak dostępnego bubblewrap kończy się
+odmową uruchomienia. To jest granica systemowa, nie obietnica sandboxa w samym
+Rust; WASM i dynamiczne biblioteki nie są obsługiwane.
 
 ## Odrzucone alternatywy
 

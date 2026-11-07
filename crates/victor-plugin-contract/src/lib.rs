@@ -106,6 +106,8 @@ pub enum ContractError {
     InvalidJson(String),
     #[error("nieobsługiwana wersja protokołu {0}")]
     UnsupportedProtocol(u32),
+    #[error("ramka nie kończy się znakiem nowej linii")]
+    MissingFrameDelimiter,
 }
 
 pub fn encode(message: &WireMessage) -> Result<Vec<u8>, ContractError> {
@@ -127,6 +129,15 @@ pub fn decode(bytes: &[u8]) -> Result<WireMessage, ContractError> {
         });
     }
     serde_json::from_slice(bytes).map_err(|e| ContractError::InvalidJson(e.to_string()))
+}
+
+/// Dekoduje kompletną ramkę transportową. Delimiter jest częścią kontraktu;
+/// wywołujący nie może przekazać niekompletnego fragmentu JSON.
+pub fn decode_frame(bytes: &[u8]) -> Result<WireMessage, ContractError> {
+    if bytes.last() != Some(&b'\n') {
+        return Err(ContractError::MissingFrameDelimiter);
+    }
+    decode(&bytes[..bytes.len() - 1])
 }
 
 #[cfg(test)]
@@ -154,6 +165,15 @@ mod tests {
         assert!(matches!(
             encode(&message),
             Err(ContractError::FrameTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn frame_requires_newline_delimiter() {
+        let message = serde_json::to_vec(&WireMessage::Shutdown).unwrap();
+        assert!(matches!(
+            decode_frame(&message),
+            Err(ContractError::MissingFrameDelimiter)
         ));
     }
 }
