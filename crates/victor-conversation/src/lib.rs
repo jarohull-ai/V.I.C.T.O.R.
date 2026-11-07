@@ -11,8 +11,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use victor_context::{
-    ContextContent, ContextItem, ContextItemId, ContextItemKind, ContextScope, ContextSource,
-    ContextStore, MemoryTier, Retention, Sensitivity,
+    build_view, ContextContent, ContextItem, ContextItemId, ContextItemKind, ContextScope,
+    ContextSource, ContextStore, ContextView, ContextViewRequest, MemoryTier, Retention,
+    Sensitivity,
 };
 use victor_domain::{Approval, Plan, PlanStep, ToolId, UnixMs};
 use victor_plugin_host::PluginLifecycleApi;
@@ -177,6 +178,14 @@ impl ConversationSession {
     pub fn context_scope(&self) -> &ContextScope {
         &self.context_scope
     }
+
+    pub fn context_view(&self, now_unix_ms: UnixMs) -> Result<ContextView, ConversationError> {
+        Ok(build_view(
+            self.store.as_ref(),
+            &ContextViewRequest::new(vec![self.context_scope.clone()], now_unix_ms)
+                .with_budget(self.limits.max_turns, self.limits.max_context_bytes as u64),
+        )?)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +205,15 @@ pub trait ConversationModel: Send + Sync {
         history: &[ConversationTurn],
         input: &str,
     ) -> Result<ModelResult, String>;
+
+    async fn respond_with_context(
+        &self,
+        history: &[ConversationTurn],
+        _context: &ContextView,
+        input: &str,
+    ) -> Result<ModelResult, String> {
+        self.respond(history, input).await
+    }
 }
 
 /// Deterministyczny backend testowy. Jest jawnie testowy i nie udaje providera.
@@ -355,7 +373,7 @@ impl<M: ConversationModel + 'static> ConversationRouter<M> {
         session.append(TurnRole::User, input, at_unix_ms, "user.text")?;
         let result = self
             .model
-            .respond(session.turns(), input)
+            .respond_with_context(session.turns(), &session.context_view(at_unix_ms)?, input)
             .await
             .map_err(ConversationError::Model)?;
         match result {

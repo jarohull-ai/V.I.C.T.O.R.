@@ -19,6 +19,7 @@ members = [
     "crates/victor-plugin-host",
     "crates/victor-daemon",
     "crates/victor-conversation",
+    "crates/victor-model-local",
 ]
 
 [workspace.package]

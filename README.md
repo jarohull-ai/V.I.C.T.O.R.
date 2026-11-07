@@ -25,6 +25,7 @@ Tauri, egui i w testach.
 | `crates/victor-skill-cli` | Referencyjny klient CLI nad Unix socketem: list/review/draft/update/approve/disable/rollback/audit |
 | `crates/victor-plugin-contract` | Wersjonowany JSON-over-stdio/JFP contract z limitem ramek i handshake |
 | `crates/victor-plugin-host` | Host procesów pluginów, sandbox boundary, restart lifecycle i trwały rejestr SQLite |
+| `crates/victor-model-local` | Lokalny model przez limitowany JSON-over-stdio; tylko Reply/PlanRequest, bez sieci i fallbacku |
 
 Decyzje o reuse: [`docs/ADR-001-reuse.md`](docs/ADR-001-reuse.md).
 
@@ -41,6 +42,19 @@ licencji MIT i zachowuje własne pliki `LICENSE` oraz `ORIGIN.md`.
 
 Publiczny gate CI dla `main` uruchamia kontrolę granic repozytorium, licencji,
 formatowania, testów, Clippy i białych znaków dla każdego push oraz pull request.
+
+## Granica lokalnego modelu
+
+`victor-model-local` uruchamia jawnie wskazany proces z wyczyszczonym
+środowiskiem i komunikuje się z nim wyłącznie przez limitowane ramki
+JSON-over-stdio. Handshake wymaga wersji protokołu i identyfikatora modelu.
+Adapter przyjmuje tylko `Reply` albo `PlanRequest`; nie istnieje w nim pole na
+capabilities, risk, scope ani executor. Każdy `PlanRequest` wraca do
+`victor-conversation`, gdzie manifest, `victor-policy`, `victor-runtime`,
+context i audit pozostają jedyną ścieżką wykonania. Uszkodzony JSON, timeout,
+EOF i crash kończą stdin/stdout przez `kill` + `wait`, a restart jest limitowany
+konfiguracją. Adapter nie ma klienta sieciowego i nigdy nie przełącza się
+automatycznie na chmurę.
 
 ## Granica pluginów
 
