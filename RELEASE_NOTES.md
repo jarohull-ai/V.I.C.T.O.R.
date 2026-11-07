@@ -11,8 +11,8 @@ Release nie utworzono i nie wypchnięto.
   (trwałe idempotency) i `86dc4d0` (weryfikacja taga rc.1);
 - istniejący tag `v0.1.0-rc.1` pozostaje bez zmian i wskazuje:
   `cd4a326ddeba8cba5fbb51192be3f89575620ced`;
-- proponowany `v0.1.0-rc.2` ma wskazywać wyłącznie zweryfikowany HEAD:
-  `86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`.
+- proponowany `v0.1.0-rc.2` ma wskazywać wyłącznie HEAD po końcowej weryfikacji
+  tego commita dokumentacyjnego.
 
 ## Zakres rc.2
 
@@ -82,7 +82,8 @@ operatora; instalator ich nie pobiera.
 Nie wykonano tej komendy:
 
 ```sh
-git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
+git rev-parse HEAD
+git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" HEAD
 ```
 
 Po utworzeniu taga push i GitHub Release wymagają osobnej, wyraźnej decyzji
