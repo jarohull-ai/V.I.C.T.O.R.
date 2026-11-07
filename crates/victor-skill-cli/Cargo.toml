@@ -9,7 +9,11 @@ name = "victor-skill"
 path = "src/main.rs"
 
 [dependencies]
+sha2.workspace = true
 serde_json.workspace = true
+victor-domain = { path = "../victor-domain" }
 victor-skill-forge = { path = "../victor-skill-forge" }
 victor-skill-transport = { path = "../victor-skill-transport" }
 victor-skills = { path = "../victor-skills" }
+victor-plugin-host = { path = "../victor-plugin-host" }
+victor-tools = { path = "../victor-tools" }

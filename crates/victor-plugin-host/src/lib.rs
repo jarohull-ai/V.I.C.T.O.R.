@@ -13,18 +13,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
-use victor_domain::{ToolId, UnixMs};
+use victor_domain::{Approval, Plan, PlanStep, ToolId, UnixMs};
 use victor_plugin_contract::{
     decode_frame_with_limit, encode_with_limit, Hello, PluginManifest, Request, Response,
     WireMessage, DEFAULT_HEARTBEAT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
 };
+use victor_policy::{Outcome, PolicyEngine};
 use victor_storage::{PluginRegistrationRecord, SqliteContextStore};
 use victor_tools::{
     AuditOutcome, AuditSink, ToolAuditEvent, ToolError, ToolExecution, ToolExecutor, ToolManifest,
@@ -81,10 +83,69 @@ impl ProcessConnection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxRequirement {
     NotRequired,
     Required,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginLaunchRequest {
+    pub command: Vec<String>,
+    pub working_dir: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub sandbox: SandboxRequirement,
+    pub sandbox_executable: Option<String>,
+    pub request_timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_restart_attempts: u32,
+}
+
+impl PluginLaunchRequest {
+    fn policy(&self) -> Result<PluginLaunchPolicy, HostError> {
+        Ok(PluginLaunchPolicy {
+            sandbox: self.sandbox.clone(),
+            sandbox_executable: self.sandbox_executable.as_ref().map(PathBuf::from),
+            working_dir: Some(PathBuf::from(&self.working_dir)),
+            environment: self.environment.clone(),
+            request_timeout_ms: self.request_timeout_ms,
+            max_frame_bytes: self.max_frame_bytes,
+            max_restart_attempts: self.max_restart_attempts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSummary {
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub manifest_hash: String,
+    pub sandbox_required: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginReview {
+    pub summary: PluginSummary,
+    pub executable_name: String,
+    pub working_dir: String,
+    pub environment_keys: Vec<String>,
+    pub argument_count: usize,
+    pub request_timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_restart_attempts: u32,
+    pub launch_spec_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginLifecycleDecision {
+    pub plugin_id: String,
+    pub action: String,
+    pub status: String,
+    pub actor: String,
+    pub reason: String,
+    pub at_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,6 +660,16 @@ impl PersistentPluginHost {
     }
 
     pub async fn restart(&mut self, id: &ToolId) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let record = self
+            .store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|record| record.plugin_id == id.as_str())
+            .ok_or_else(|| HostError::NotRegistered(id.to_string()))?;
+        let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        validate_persisted_launch_spec(&record, &manifest)?;
         let executor = self
             .host
             .get(id)
@@ -619,6 +690,310 @@ impl PersistentPluginHost {
             .remove_plugin_registration(id.as_str())
             .map_err(storage_host_error)?;
         self.record_lifecycle(id, AuditOutcome::Succeeded, "unregister")
+    }
+}
+
+/// UI-agnostyczna brama lifecycle. Transport i CLI otrzymują wyłącznie ten
+/// interfejs; registry, policy, SQLite i executory pozostają po stronie hosta.
+pub struct PluginLifecycleApi {
+    host: PersistentPluginHost,
+    registry: victor_tools::ToolRegistry,
+    policy: Arc<PolicyEngine>,
+    store: Arc<SqliteContextStore>,
+    catalog: BTreeMap<String, (ToolManifest, Vec<String>, PluginLaunchPolicy)>,
+}
+
+impl PluginLifecycleApi {
+    pub async fn open(
+        store: Arc<SqliteContextStore>,
+        policy: Arc<PolicyEngine>,
+        audit: Option<Arc<dyn AuditSink>>,
+    ) -> Result<Self, HostError> {
+        for record in store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .filter(|record| record.status == "active")
+        {
+            let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+            check_manifest_policy(&policy, &manifest, None, 0)?;
+        }
+        let host = PersistentPluginHost::open(store.clone(), audit).await?;
+        let mut registry = victor_tools::ToolRegistry::new();
+        for record in store.plugin_registrations().map_err(storage_host_error)? {
+            let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+            registry
+                .register(manifest)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        }
+        Ok(Self {
+            host,
+            registry,
+            policy,
+            store,
+            catalog: BTreeMap::new(),
+        })
+    }
+
+    /// Dodaje definicję zaufaną przez proces serwera. UI/CLI może wybrać tylko
+    /// jej identyfikator; nie może nadać sobie manifestu, capabilities, risku
+    /// ani launch policy.
+    pub fn with_plugin_definition(
+        mut self,
+        manifest: ToolManifest,
+        command: Vec<String>,
+        launch_policy: PluginLaunchPolicy,
+    ) -> Result<Self, HostError> {
+        manifest
+            .validate()
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        let id = manifest.descriptor.id.as_str().to_string();
+        if self.catalog.contains_key(&id) {
+            return Err(HostError::RegistrationConflict(id));
+        }
+        let launch_policy = normalize_launch_policy(launch_policy)?;
+        validate_executable(&command)?;
+        self.catalog.insert(id, (manifest, command, launch_policy));
+        Ok(self)
+    }
+
+    pub fn list(&self) -> Result<Vec<PluginSummary>, HostError> {
+        self.store
+            .plugin_registrations()
+            .map_err(storage_host_error)
+            .map(|records| records.iter().map(summary_from_record).collect())
+    }
+
+    pub fn review(&self, id: &ToolId) -> Result<PluginReview, HostError> {
+        let record = self.record(id)?;
+        let launch_spec_verified =
+            record.status == "disabled" || self.verify_record(&record).is_ok();
+        let executable_name = Path::new(&record.executable_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        Ok(PluginReview {
+            summary: summary_from_record(&record),
+            executable_name,
+            working_dir: record.working_dir.clone(),
+            environment_keys: record.environment.keys().cloned().collect(),
+            argument_count: record.command.len().saturating_sub(1),
+            request_timeout_ms: record.request_timeout_ms,
+            max_frame_bytes: record.max_frame_bytes,
+            max_restart_attempts: record.max_restart_attempts,
+            launch_spec_verified,
+        })
+    }
+
+    pub fn audit_history(
+        &self,
+        id: Option<&ToolId>,
+    ) -> Result<Vec<PluginLifecycleDecision>, HostError> {
+        self.store
+            .plugin_lifecycle_history(id.map(ToolId::as_str))
+            .map_err(storage_host_error)
+            .map(|records| {
+                records
+                    .into_iter()
+                    .map(|record| PluginLifecycleDecision {
+                        plugin_id: record.plugin_id,
+                        action: record.action,
+                        status: record.status,
+                        actor: record.actor,
+                        reason: record.reason,
+                        at_unix_ms: record.at_unix_ms,
+                    })
+                    .collect()
+            })
+    }
+
+    pub async fn register(
+        &mut self,
+        manifest: ToolManifest,
+        launch: PluginLaunchRequest,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<PluginSummary, HostError> {
+        let trusted = self
+            .catalog
+            .get(manifest.descriptor.id.as_str())
+            .ok_or_else(|| {
+                HostError::InvalidLaunchPolicy("plugin nie ma zaufanej definicji serwera".into())
+            })?;
+        if trusted.0 != manifest || trusted.1 != launch.command || trusted.2 != launch.policy()? {
+            return Err(HostError::InvalidLaunchPolicy(
+                "manifest lub launch spec różni się od definicji serwera".into(),
+            ));
+        }
+        self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
+        let id = manifest.descriptor.id.clone();
+        let policy = launch.policy()?;
+        self.host
+            .register_into_registry(launch.command, manifest, policy, &mut self.registry)
+            .await?;
+        self.record_decision(&id, "register", "active", actor, reason, at_unix_ms)?;
+        self.summary(&id)
+    }
+
+    pub async fn activate(
+        &mut self,
+        id: &ToolId,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<PluginSummary, HostError> {
+        let manifest = self.manifest(id)?;
+        self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
+        self.host.activate(id, &mut self.registry).await?;
+        self.record_decision(id, "activate", "active", actor, reason, at_unix_ms)?;
+        self.summary(id)
+    }
+
+    pub fn disable(
+        &mut self,
+        id: &ToolId,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<PluginSummary, HostError> {
+        let manifest = self.manifest(id)?;
+        self.check_policy(&manifest, None, at_unix_ms)?;
+        self.host.disable(id)?;
+        self.record_decision(id, "disable", "disabled", actor, reason, at_unix_ms)?;
+        self.summary(id)
+    }
+
+    pub async fn restart(
+        &mut self,
+        id: &ToolId,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<PluginSummary, HostError> {
+        let manifest = self.manifest(id)?;
+        self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
+        self.host.restart(id).await?;
+        self.record_decision(id, "restart", "active", actor, reason, at_unix_ms)?;
+        self.summary(id)
+    }
+
+    pub fn unregister(
+        &mut self,
+        id: &ToolId,
+        explicit_decision: bool,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<Value, HostError> {
+        if !explicit_decision {
+            return Err(HostError::InvalidLaunchPolicy(
+                "unregister wymaga jawnej decyzji użytkownika".into(),
+            ));
+        }
+        self.host.unregister(id, true)?;
+        self.record_decision(id, "unregister", "removed", actor, reason, at_unix_ms)?;
+        Ok(serde_json::json!({"plugin_id": id, "status": "removed"}))
+    }
+
+    fn record(&self, id: &ToolId) -> Result<PluginRegistrationRecord, HostError> {
+        self.store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|record| record.plugin_id == id.as_str())
+            .ok_or_else(|| HostError::NotRegistered(id.to_string()))
+    }
+
+    fn manifest(&self, id: &ToolId) -> Result<ToolManifest, HostError> {
+        let record = self.record(id)?;
+        serde_json::from_str(&record.manifest_json)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))
+    }
+
+    fn summary(&self, id: &ToolId) -> Result<PluginSummary, HostError> {
+        Ok(summary_from_record(&self.record(id)?))
+    }
+
+    fn verify_record(&self, record: &PluginRegistrationRecord) -> Result<(), HostError> {
+        let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        validate_persisted_launch_spec(record, &manifest)
+    }
+
+    fn check_policy(
+        &self,
+        manifest: &ToolManifest,
+        approval: Option<&Approval>,
+        now: u64,
+    ) -> Result<(), HostError> {
+        check_manifest_policy(&self.policy, manifest, approval, now)
+    }
+}
+
+fn check_manifest_policy(
+    policy: &PolicyEngine,
+    manifest: &ToolManifest,
+    approval: Option<&Approval>,
+    now: u64,
+) -> Result<(), HostError> {
+    let plan = Plan::new(
+        "plugin-lifecycle",
+        now.min(u32::MAX as u64) as u32,
+        format!("plugin lifecycle: {}", manifest.descriptor.id),
+        vec![PlanStep::new(
+            manifest.descriptor.id.clone(),
+            "plugin lifecycle",
+            serde_json::json!({}),
+            manifest.descriptor.risk,
+        )],
+    )
+    .map_err(|error| HostError::InvalidLaunchPolicy(error.to_string()))?;
+    let decision = policy.evaluate_plan(std::slice::from_ref(&manifest.descriptor), &plan);
+    if decision.outcome == Outcome::Denied {
+        return Err(HostError::InvalidLaunchPolicy(decision.reasons.join("; ")));
+    }
+    policy
+        .require_approval(&plan, approval, now)
+        .map_err(|error| HostError::InvalidLaunchPolicy(error.to_string()))
+}
+
+impl PluginLifecycleApi {
+    fn record_decision(
+        &self,
+        id: &ToolId,
+        action: &str,
+        status: &str,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    ) -> Result<(), HostError> {
+        self.store
+            .record_plugin_lifecycle(&victor_storage::PluginLifecycleAuditRecord {
+                plugin_id: id.to_string(),
+                action: action.into(),
+                status: status.into(),
+                actor,
+                reason,
+                at_unix_ms,
+            })
+            .map_err(storage_host_error)
+    }
+}
+
+fn summary_from_record(record: &PluginRegistrationRecord) -> PluginSummary {
+    PluginSummary {
+        plugin_id: record.plugin_id.clone(),
+        plugin_version: record.plugin_version.clone(),
+        manifest_hash: record.manifest_hash.clone(),
+        sandbox_required: record.sandbox_required,
+        status: record.status.clone(),
     }
 }
 

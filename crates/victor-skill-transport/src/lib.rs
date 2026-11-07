@@ -8,10 +8,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use sha2::{Digest, Sha256};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio::time::timeout;
+use victor_domain::{Approval, ToolId};
+use victor_plugin_host::{PluginLaunchRequest, PluginLifecycleApi};
 use victor_skill_api::{SkillApi, SkillApiError};
 use victor_skill_forge::ForgeRequest;
 use victor_skills::{SkillId, SkillManifest};
@@ -54,6 +57,56 @@ pub enum SkillOperation {
         skill_id: Option<SkillId>,
     },
     Snapshot,
+    Plugin {
+        plugin_operation: PluginOperation,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PluginOperation {
+    List,
+    Review {
+        plugin_id: ToolId,
+    },
+    Register {
+        manifest: Box<victor_tools::ToolManifest>,
+        launch: Box<PluginLaunchRequest>,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    },
+    Activate {
+        plugin_id: ToolId,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    },
+    Disable {
+        plugin_id: ToolId,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    },
+    Restart {
+        plugin_id: ToolId,
+        approval: Option<Approval>,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    },
+    Unregister {
+        plugin_id: ToolId,
+        explicit_decision: bool,
+        actor: String,
+        reason: String,
+        at_unix_ms: u64,
+    },
+    AuditHistory {
+        plugin_id: Option<ToolId>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,10 +140,19 @@ pub enum TransportError {
 
 struct ServerState {
     api: SkillApi,
+    plugin_api: Option<Arc<Mutex<PluginLifecycleApi>>>,
     token: String,
     scope: String,
     max_request_bytes: usize,
-    idempotent: HashMap<String, SkillResponse>,
+    idempotent: HashMap<String, CachedResponse>,
+}
+
+#[derive(Clone)]
+struct CachedResponse {
+    principal: String,
+    scope: String,
+    request_hash: String,
+    response: SkillResponse,
 }
 
 pub struct UnixSkillServer {
@@ -117,6 +179,7 @@ impl UnixSkillServer {
             socket_path: socket_path.into(),
             state: Arc::new(Mutex::new(ServerState {
                 api,
+                plugin_api: None,
                 token,
                 scope,
                 max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
@@ -124,6 +187,13 @@ impl UnixSkillServer {
             })),
             request_timeout: DEFAULT_TIMEOUT,
         })
+    }
+
+    pub fn with_plugin_api(self, plugin_api: PluginLifecycleApi) -> Self {
+        if let Ok(mut guard) = self.state.try_lock() {
+            guard.plugin_api = Some(Arc::new(Mutex::new(plugin_api)));
+        }
+        self
     }
 
     pub fn with_limits(
@@ -185,24 +255,22 @@ async fn handle_connection(
     let mut reader = BufReader::new(read_half);
     loop {
         let max_request_bytes = state.lock().await.max_request_bytes;
-        let mut bytes = Vec::new();
-        let read = timeout(request_timeout, reader.read_until(b'\n', &mut bytes))
-            .await
-            .map_err(|_| TransportError::Timeout)??;
-        if read == 0 {
+        let bytes = match timeout(
+            request_timeout,
+            read_limited_line(&mut reader, max_request_bytes),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                write_response(&mut write_half, failure(error.to_string())).await?;
+                return Ok(());
+            }
+        };
+        if bytes.is_empty() {
             return Ok(());
-        }
-        if bytes.len() > max_request_bytes {
-            write_response(
-                &mut write_half,
-                SkillResponse {
-                    ok: false,
-                    result: None,
-                    error: Some(TransportError::RequestTooLarge(max_request_bytes).to_string()),
-                },
-            )
-            .await?;
-            continue;
         }
         let request: SkillRequest = match serde_json::from_slice(&bytes) {
             Ok(request) => request,
@@ -223,6 +291,37 @@ async fn handle_connection(
     }
 }
 
+async fn read_limited_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, TransportError> {
+    let mut frame = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(frame))
+            };
+        }
+        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
+            if frame.len().saturating_add(position + 1) > max_bytes {
+                return Err(TransportError::RequestTooLarge(max_bytes));
+            }
+            frame.extend_from_slice(&available[..=position]);
+            reader.consume(position + 1);
+            return Ok(Some(frame));
+        }
+        if frame.len().saturating_add(available.len()) > max_bytes {
+            return Err(TransportError::RequestTooLarge(max_bytes));
+        }
+        frame.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+}
+
 async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     response: SkillResponse,
@@ -235,6 +334,11 @@ async fn write_response(
 
 async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> SkillResponse {
     let key = request.idempotency_key.clone();
+    let principal = hash_text(&request.token);
+    let request_hash = match serde_json::to_vec(&(&request.scope, &request.operation)) {
+        Ok(bytes) => hash_bytes(&bytes),
+        Err(error) => return failure(format!("nie można zhashować żądania: {error}")),
+    };
     let mut guard = state.lock().await;
     if request.token != guard.token {
         return failure("nieautoryzowany klient");
@@ -243,20 +347,35 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         return failure("odmowa scope klienta");
     }
     if let Some(key) = key.as_ref() {
-        if let Some(response) = guard.idempotent.get(key) {
-            return response.clone();
+        if let Some(cached) = guard.idempotent.get(key) {
+            if cached.principal == principal
+                && cached.scope == request.scope
+                && cached.request_hash == request_hash
+            {
+                return cached.response.clone();
+            }
+            return failure("konflikt klucza idempotency");
         }
     }
-    let result = match request.operation {
-        SkillOperation::List => serde_json::to_value(guard.api.list())
-            .map_err(|error| SkillApiError::Audit(error.to_string())),
-        SkillOperation::Review { skill_id } => guard.api.review(&skill_id).and_then(to_value),
-        SkillOperation::CreateDraft { request } => {
-            guard.api.create_draft(request).and_then(to_value)
+    let result: Result<Value, String> = match request.operation {
+        SkillOperation::List => {
+            serde_json::to_value(guard.api.list()).map_err(|error| error.to_string())
         }
-        SkillOperation::Update { manifest } => {
-            guard.api.update_manifest(manifest).and_then(to_value)
-        }
+        SkillOperation::Review { skill_id } => guard
+            .api
+            .review(&skill_id)
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
+        SkillOperation::CreateDraft { request } => guard
+            .api
+            .create_draft(request)
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
+        SkillOperation::Update { manifest } => guard
+            .api
+            .update_manifest(manifest)
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
         SkillOperation::ApproveActivate {
             skill_id,
             actor,
@@ -265,7 +384,8 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         } => guard
             .api
             .validate_and_approve_activate(&skill_id, &actor, at_unix_ms, &reason)
-            .and_then(to_value),
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
         SkillOperation::Disable {
             skill_id,
             actor,
@@ -274,7 +394,8 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         } => guard
             .api
             .disable(&skill_id, &actor, at_unix_ms, &reason)
-            .and_then(to_value),
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
         SkillOperation::Rollback {
             skill_id,
             actor,
@@ -283,12 +404,25 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         } => guard
             .api
             .rollback(&skill_id, &actor, at_unix_ms, &reason)
-            .and_then(to_value),
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
         SkillOperation::AuditHistory { skill_id } => guard
             .api
             .audit_history(skill_id.as_ref())
-            .and_then(to_value),
-        SkillOperation::Snapshot => guard.api.snapshot_json().and_then(to_value),
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
+        SkillOperation::Snapshot => guard
+            .api
+            .snapshot_json()
+            .and_then(to_value)
+            .map_err(|error| error.to_string()),
+        SkillOperation::Plugin { plugin_operation } => {
+            let Some(plugin_api) = guard.plugin_api.as_ref().cloned() else {
+                return failure("plugin lifecycle API nie jest skonfigurowane");
+            };
+            let mut plugin_api = plugin_api.lock().await;
+            dispatch_plugin(&mut plugin_api, plugin_operation).await
+        }
     };
     let response = match result {
         Ok(result) => SkillResponse {
@@ -299,9 +433,91 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         Err(error) => failure(error.to_string()),
     };
     if let Some(key) = key {
-        guard.idempotent.insert(key, response.clone());
+        guard.idempotent.insert(
+            key,
+            CachedResponse {
+                principal,
+                scope: request.scope,
+                request_hash,
+                response: response.clone(),
+            },
+        );
     }
     response
+}
+
+async fn dispatch_plugin(
+    api: &mut PluginLifecycleApi,
+    operation: PluginOperation,
+) -> Result<Value, String> {
+    match operation {
+        PluginOperation::List => plugin_value(api.list()),
+        PluginOperation::Review { plugin_id } => plugin_value(api.review(&plugin_id)),
+        PluginOperation::Register {
+            manifest,
+            launch,
+            approval,
+            actor,
+            reason,
+            at_unix_ms,
+        } => plugin_value(
+            api.register(*manifest, *launch, approval, actor, reason, at_unix_ms)
+                .await,
+        ),
+        PluginOperation::Activate {
+            plugin_id,
+            approval,
+            actor,
+            reason,
+            at_unix_ms,
+        } => plugin_value(
+            api.activate(&plugin_id, approval, actor, reason, at_unix_ms)
+                .await,
+        ),
+        PluginOperation::Disable {
+            plugin_id,
+            actor,
+            reason,
+            at_unix_ms,
+        } => plugin_value(api.disable(&plugin_id, actor, reason, at_unix_ms)),
+        PluginOperation::Restart {
+            plugin_id,
+            approval,
+            actor,
+            reason,
+            at_unix_ms,
+        } => plugin_value(
+            api.restart(&plugin_id, approval, actor, reason, at_unix_ms)
+                .await,
+        ),
+        PluginOperation::Unregister {
+            plugin_id,
+            explicit_decision,
+            actor,
+            reason,
+            at_unix_ms,
+        } => plugin_value(api.unregister(&plugin_id, explicit_decision, actor, reason, at_unix_ms)),
+        PluginOperation::AuditHistory { plugin_id } => {
+            plugin_value(api.audit_history(plugin_id.as_ref()))
+        }
+    }
+}
+
+fn plugin_value<T: Serialize>(
+    result: Result<T, victor_plugin_host::HostError>,
+) -> Result<Value, String> {
+    result
+        .map_err(|error| error.to_string())
+        .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
+}
+
+fn hash_text(value: &str) -> String {
+    hash_bytes(value.as_bytes())
+}
+
+fn hash_bytes(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn to_value<T: Serialize>(value: T) -> Result<Value, SkillApiError> {
@@ -434,7 +650,15 @@ mod tests {
         unauthorized_approve.token = "wrong-token-123456".into();
         assert!(!roundtrip(&path, unauthorized_approve).await.ok);
         assert!(roundtrip(&path, approve.clone()).await.ok);
-        assert!(roundtrip(&path, approve).await.ok);
+        assert!(roundtrip(&path, approve.clone()).await.ok);
+        let mut conflicting = approve;
+        conflicting.operation = SkillOperation::Disable {
+            skill_id: SkillId::parse("transport.demo").unwrap(),
+            actor: "user".into(),
+            reason: "different request".into(),
+            at_unix_ms: 2,
+        };
+        assert!(!roundtrip(&path, conflicting).await.ok);
         let mut audit = request();
         audit.operation = SkillOperation::AuditHistory { skill_id: None };
         assert_eq!(
@@ -447,6 +671,48 @@ mod tests {
                 .len(),
             2
         );
+        let _ = shutdown_tx.send(());
+        assert!(server_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn plugin_operations_use_auth_scope_and_redacted_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plugins.sock");
+        let database = Arc::new(SqliteContextStore::in_memory().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            victor_policy::PolicyEngine::new(PolicyConfig::new([root.path().to_path_buf()]))
+                .unwrap(),
+        );
+        let plugin_api = victor_plugin_host::PluginLifecycleApi::open(database, policy, None)
+            .await
+            .unwrap();
+        let server = UnixSkillServer::new(&path, "0123456789abcdef", "default", api())
+            .unwrap()
+            .with_plugin_api(plugin_api);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.run(shutdown_rx));
+        for _ in 0..20 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let list = roundtrip(
+            &path,
+            operation_request(SkillOperation::Plugin {
+                plugin_operation: PluginOperation::List,
+            }),
+        )
+        .await;
+        assert!(list.ok);
+        assert!(list.result.unwrap().as_array().unwrap().is_empty());
+        let mut bad_scope = operation_request(SkillOperation::Plugin {
+            plugin_operation: PluginOperation::List,
+        });
+        bad_scope.scope = "other".into();
+        assert!(!roundtrip(&path, bad_scope).await.ok);
         let _ = shutdown_tx.send(());
         assert!(server_task.await.unwrap().is_ok());
     }

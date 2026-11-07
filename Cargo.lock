@@ -1922,6 +1922,7 @@ name = "victor-plugin-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -1989,9 +1990,13 @@ name = "victor-skill-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2 0.10.9",
+ "victor-domain",
+ "victor-plugin-host",
  "victor-skill-forge",
  "victor-skill-transport",
  "victor-skills",
+ "victor-tools",
 ]
 
 [[package]]
@@ -2015,10 +2020,12 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
  "victor-domain",
+ "victor-plugin-host",
  "victor-policy",
  "victor-skill-api",
  "victor-skill-forge",
@@ -2046,6 +2053,7 @@ name = "victor-storage"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

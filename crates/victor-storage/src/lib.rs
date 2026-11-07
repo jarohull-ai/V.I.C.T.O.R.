@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::{Deserialize, Serialize};
 use victor_context::{
     ContextContent, ContextError, ContextItem, ContextItemId, ContextItemKind, ContextScope,
     ContextSource, ContextStore, MemoryTier, Origin, Retention, ScopeKind, Sensitivity,
@@ -50,6 +51,16 @@ pub struct PluginRegistrationRecord {
     pub max_restart_attempts: u32,
     pub launch_spec_hash: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLifecycleAuditRecord {
+    pub plugin_id: String,
+    pub action: String,
+    pub status: String,
+    pub actor: String,
+    pub reason: String,
+    pub at_unix_ms: u64,
 }
 
 impl SqliteContextStore {
@@ -148,7 +159,18 @@ impl SqliteContextStore {
                  max_restart_attempts INTEGER NOT NULL,
                  launch_spec_hash TEXT NOT NULL,
                  status TEXT NOT NULL CHECK (status IN ('active', 'disabled'))
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS plugin_lifecycle_audit (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 plugin_id TEXT NOT NULL,
+                 action TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 actor TEXT NOT NULL,
+                 reason TEXT NOT NULL,
+                 at_unix_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_plugin_lifecycle_audit
+                 ON plugin_lifecycle_audit(plugin_id, at_unix_ms, id);",
         )?;
         let columns = connection
             .prepare("PRAGMA table_info(plugin_registrations)")?
@@ -282,6 +304,52 @@ impl SqliteContextStore {
             ));
         }
         Ok(())
+    }
+
+    pub fn record_plugin_lifecycle(
+        &self,
+        record: &PluginLifecycleAuditRecord,
+    ) -> Result<(), StorageError> {
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO plugin_lifecycle_audit
+             (plugin_id, action, status, actor, reason, at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.plugin_id,
+                record.action,
+                record.status,
+                record.actor,
+                record.reason,
+                record.at_unix_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn plugin_lifecycle_history(
+        &self,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<PluginLifecycleAuditRecord>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT plugin_id, action, status, actor, reason, at_unix_ms
+             FROM plugin_lifecycle_audit
+             WHERE (?1 IS NULL OR plugin_id = ?1)
+             ORDER BY at_unix_ms ASC, id ASC",
+        )?;
+        let rows = statement.query_map(params![plugin_id], |row| {
+            Ok(PluginLifecycleAuditRecord {
+                plugin_id: row.get(0)?,
+                action: row.get(1)?,
+                status: row.get(2)?,
+                actor: row.get(3)?,
+                reason: row.get(4)?,
+                at_unix_ms: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn plugin_registrations(&self) -> Result<Vec<PluginRegistrationRecord>, StorageError> {
