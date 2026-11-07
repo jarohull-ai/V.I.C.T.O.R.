@@ -130,10 +130,10 @@ impl Daemon {
             PluginLifecycleApi::open(store.clone(), policy.clone(), Some(store.clone()))
                 .await
                 .map_err(|e| DaemonError::Host(e.to_string()))?;
-        for definition in definitions {
+        for definition in &definitions {
             plugin_api = plugin_api
                 .with_plugin_definition(
-                    definition.manifest,
+                    definition.manifest.clone(),
                     definition.launch.command.clone(),
                     launch_policy(&definition.launch)?,
                 )
@@ -150,12 +150,24 @@ impl Daemon {
             )
             .with_transactional_store(store.clone()),
         );
+        let default_path = definitions.iter().find_map(|definition| {
+            definition
+                .launch
+                .command
+                .windows(2)
+                .find(|pair| pair[0] == "--root")
+                .map(|pair| pair[1].clone())
+        });
         let router = ConversationRouter::new(
             Arc::new(DeterministicTestModel),
             runtime,
             runtime_registry,
             plugin_api.clone(),
         );
+        let router = match default_path {
+            Some(path) => router.with_default_path(path),
+            None => router,
+        };
         let conversation: Arc<dyn ConversationService> = Arc::new(ConversationEngine::new(
             router,
             store.clone(),

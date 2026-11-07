@@ -109,6 +109,98 @@ async fn sysinfo_goes_through_runtime_policy_context_and_audit() {
 }
 
 #[tokio::test]
+async fn files_read_goes_through_policy_plugin_context_and_audit() {
+    let root = tempdir().unwrap();
+    let file = root.path().join("note.txt");
+    std::fs::write(&file, "bezpieczna tresc").unwrap();
+    let manifest = ToolManifest::new(
+        "1.0.0",
+        ToolDescriptor {
+            id: ToolId::parse("files.read").unwrap(),
+            schema_version: 1,
+            description: "read-only file".into(),
+            input_schema: json!({"type":"object","required":["path"],"properties":{"path":{"type":"string"}}}),
+            output_schema: json!({"type":"object"}),
+            capabilities: vec![victor_domain::Capability::FilesystemRead {
+                scope: victor_domain::PathScope::new(root.path()),
+            }],
+            risk: RiskLevel::R0,
+            default_timeout_ms: 2_000,
+            undo_support: false,
+            path_arguments: vec!["path".into()],
+        },
+    );
+    let executable = std::path::Path::new(env!("CARGO_BIN_EXE_files_inspect"));
+    let mut executable_permissions = std::fs::metadata(executable).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        executable_permissions.set_mode(executable_permissions.mode() & !0o022);
+        std::fs::set_permissions(executable, executable_permissions).unwrap();
+    }
+    let command = vec![
+        executable.display().to_string(),
+        "--root".into(),
+        root.path().display().to_string(),
+    ];
+    let policy = Arc::new(
+        PolicyEngine::new(
+            PolicyConfig::new([root.path().to_path_buf()])
+                .with_enabled_tools([ToolId::parse("files.read").unwrap()]),
+        )
+        .unwrap(),
+    );
+    let store = Arc::new(SqliteContextStore::in_memory().unwrap());
+    let mut registry = ToolRegistry::new();
+    registry.register(manifest.clone()).unwrap();
+    let runtime = ToolRuntime::new(Arc::new(registry), policy, store.clone(), store.clone())
+        .with_transactional_store(store.clone());
+    let executor = PluginToolExecutor::spawn_with_policy(
+        command,
+        manifest,
+        PluginLaunchPolicy {
+            working_dir: Some(root.path().to_path_buf()),
+            ..PluginLaunchPolicy::default()
+        },
+        Some(store.clone()),
+    )
+    .await
+    .unwrap();
+    let tool = ToolId::parse("files.read").unwrap();
+    let plan = Plan::new(
+        "conversation-files",
+        1,
+        "read note",
+        vec![PlanStep::new(
+            tool.clone(),
+            "read note",
+            json!({"path": file, "max_bytes": 1024}),
+            RiskLevel::R0,
+        )],
+    )
+    .unwrap();
+    let output = runtime
+        .execute(
+            &plan,
+            None,
+            victor_runtime::ToolExecutionJob {
+                result_item_id: ContextItemId::parse("files-result").unwrap(),
+                scope: ContextScope::conversation("conversation-files").unwrap(),
+                started_at_unix_ms: 1,
+            },
+            &executor,
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.result.output["content"], "bezpieczna tresc");
+    assert!(store
+        .get(&output.context_item.id, &output.context_item.scope)
+        .unwrap()
+        .is_some());
+    assert_eq!(store.audit_count().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn rejects_bad_handshake_and_oversized_frame() {
     assert!(matches!(
         PluginToolExecutor::spawn(fixture("bad-handshake", None), manifest()).await,

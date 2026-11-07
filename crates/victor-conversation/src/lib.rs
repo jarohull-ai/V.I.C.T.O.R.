@@ -209,10 +209,30 @@ impl ConversationModel for DeterministicTestModel {
         _history: &[ConversationTurn],
         input: &str,
     ) -> Result<ModelResult, String> {
+        if let Some(path) = input.strip_prefix("files.read:") {
+            let path = path.trim();
+            if path.is_empty() {
+                return Err("files.read wymaga ścieżki".into());
+            }
+            return Ok(ModelResult::PlanRequest {
+                tool: ToolId::parse("files.read").map_err(|e| e.to_string())?,
+                description: "Odczytaj wskazany plik".into(),
+                args: serde_json::json!({"path": path, "max_bytes": 64 * 1024}),
+            });
+        }
         if input.to_ascii_lowercase().contains("plugin_sysinfo") {
             Ok(ModelResult::PlanRequest {
                 tool: ToolId::parse("plugin_sysinfo").map_err(|e| e.to_string())?,
                 description: "Odczytaj lokalne CPU i RAM".into(),
+                args: serde_json::json!({}),
+            })
+        } else if input.to_ascii_lowercase().contains("plik")
+            || input.to_ascii_lowercase().contains("files")
+            || input.to_ascii_lowercase().contains("projekt")
+        {
+            Ok(ModelResult::PlanRequest {
+                tool: ToolId::parse("files.list").map_err(|e| e.to_string())?,
+                description: "Sprawdź pliki w skonfigurowanym projekcie".into(),
                 args: serde_json::json!({}),
             })
         } else {
@@ -297,6 +317,7 @@ pub struct ConversationRouter<M> {
     runtime: Arc<ToolRuntime>,
     registry: Arc<ToolRegistry>,
     plugins: Arc<tokio::sync::Mutex<PluginLifecycleApi>>,
+    default_path: Option<String>,
 }
 
 impl<M: ConversationModel + 'static> ConversationRouter<M> {
@@ -311,7 +332,13 @@ impl<M: ConversationModel + 'static> ConversationRouter<M> {
             runtime,
             registry,
             plugins,
+            default_path: None,
         }
+    }
+
+    pub fn with_default_path(mut self, path: impl Into<String>) -> Self {
+        self.default_path = Some(path.into());
+        self
     }
 
     pub async fn handle(
@@ -341,6 +368,20 @@ impl<M: ConversationModel + 'static> ConversationRouter<M> {
                     .registry
                     .get(&tool)
                     .ok_or_else(|| ConversationError::UnknownTool(tool.clone()))?;
+                let args = if self.default_path.is_some()
+                    && args
+                        .as_object()
+                        .is_some_and(|value| !value.contains_key("path"))
+                {
+                    let mut object = args.as_object().cloned().unwrap_or_default();
+                    object.insert(
+                        "path".into(),
+                        Value::String(self.default_path.clone().unwrap_or_default()),
+                    );
+                    Value::Object(object)
+                } else {
+                    args
+                };
                 let plan = Plan::new(
                     format!("conversation:{}", session.conversation_id),
                     1,
