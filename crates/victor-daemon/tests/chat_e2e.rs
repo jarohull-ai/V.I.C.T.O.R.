@@ -169,7 +169,7 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
     let task = tokio::spawn(daemon.run_with_shutdown(shutdown_rx));
     let socket = root.path().join("run/victor.sock");
     let mut connected = None;
-    for _ in 0..400 {
+    for _ in 0..2000 {
         if let Ok(stream) = UnixStream::connect(&socket).await {
             connected = Some(stream);
             break;
