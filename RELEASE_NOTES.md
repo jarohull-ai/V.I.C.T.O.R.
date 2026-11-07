@@ -21,7 +21,7 @@ arbitralnego wykonywania kodu.
 
 ## Zweryfikowany stan repozytorium
 
-- `HEAD == origin/main`: `5d6d6db8a1be98d1a8f1bb18996b9bd20396272c`;
+- `HEAD == origin/main`: `cd4a326ddeba8cba5fbb51192be3f89575620ced`;
 - checkout czysty przed przygotowaniem release notes;
 - licencja workspace V.I.C.T.O.R.: BUSL-1.1;
 - licencja MIT występuje wyłącznie w `vendor/bse-fetch`;
@@ -103,7 +103,7 @@ Instalator niczego nie pobiera i nie zapisuje sekretów do konfiguracji.
 Nie wykonano tej komendy. Po wyraźnym potwierdzeniu właściciela:
 
 ```sh
-git tag -a v0.1.0-rc.1 -m "V.I.C.T.O.R. v0.1.0-rc.1" 5d6d6db8a1be98d1a8f1bb18996b9bd20396272c
+git tag -a v0.1.0-rc.1 -m "V.I.C.T.O.R. v0.1.0-rc.1" cd4a326ddeba8cba5fbb51192be3f89575620ced
 git push origin v0.1.0-rc.1
 ```
 

@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_LICENSE = "BUSL-1.1"
+EXPECTED_RC_COMMIT = "cd4a326ddeba8cba5fbb51192be3f89575620ced"
 VENDORED_DIR = (ROOT / "vendor" / "bse-fetch").resolve()
 
 
@@ -59,6 +60,13 @@ def main() -> None:
         fail("workspace license must be BUSL-1.1")
     if not (ROOT / "LICENSE").is_file():
         fail("root LICENSE is missing")
+    release_notes = ROOT / "RELEASE_NOTES.md"
+    if release_notes.is_file():
+        release_text = release_notes.read_text(encoding="utf-8")
+        if EXPECTED_RC_COMMIT not in release_text:
+            fail("RELEASE_NOTES.md must reference the verified v0.1.0-rc.1 commit")
+        if "5d6d6db8a1be98d1a8f1bb18996b9bd20396272c" in release_text:
+            fail("RELEASE_NOTES.md contains the superseded RC commit")
 
     members = workspace.get("members", [])
     if not isinstance(members, list):
