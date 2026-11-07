@@ -37,7 +37,7 @@ fn private_file(path: &Path, bytes: &[u8]) {
 }
 
 #[tokio::test]
-async fn chat_routes_local_model_policy_plugin_context_and_audit() {
+async fn voice_smoke_full_chain_restart_and_security() {
     let root = tempdir().unwrap();
     let runtime = root.path().join("run");
     let defs = root.path().join("defs");
@@ -198,7 +198,7 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
         local_stt_definition: root.path().join("defs/local-stt.json"),
         local_tts_definition: Some(root.path().join("defs/local-tts.json")),
     };
-    let daemon = Daemon::prepare(config).await.unwrap();
+    let daemon = Daemon::prepare(config.clone()).await.unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(daemon.run_with_shutdown(shutdown_rx));
     let socket = root.path().join("run/victor.sock");
@@ -257,6 +257,42 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
     assert_eq!(response["result"]["location"], "local");
     assert_eq!(response["result"]["transcript"], "pokaż status systemu");
     assert_eq!(response["result"]["tts"]["status"], "synthesized");
+    let first_voice_response = response.clone();
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", request).as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    let replay: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(replay, first_voice_response);
+    let mut unauthorized = request.clone();
+    unauthorized["token"] = serde_json::json!("wrong-token-123456");
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", unauthorized).as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["ok"],
+        false
+    );
+    let mut wrong_scope = request.clone();
+    wrong_scope["scope"] = serde_json::json!("other");
+    reader
+        .get_mut()
+        .write_all(format!("{}\n", wrong_scope).as_bytes())
+        .await
+        .unwrap();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["ok"],
+        false
+    );
     let _ = shutdown_tx.send(());
     assert!(task.await.unwrap().is_ok());
     let store = SqliteContextStore::open(&sqlite_path).unwrap();
@@ -267,4 +303,45 @@ async fn chat_routes_local_model_policy_plugin_context_and_audit() {
         ContextContent::Inline { text } => !text.contains("RIFF"),
         ContextContent::Reference { .. } => true,
     }));
+
+    let daemon = Daemon::prepare(config).await.unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(daemon.run_with_shutdown(shutdown_rx));
+    let mut connected = None;
+    for _ in 0..2000 {
+        if let Ok(stream) = UnixStream::connect(&socket).await {
+            connected = Some(stream);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let mut stream = match connected {
+        Some(stream) => stream,
+        None => {
+            panic!(
+                "daemon po restarcie nie otworzył prywatnego socketu: {:?}",
+                task.await
+            )
+        }
+    };
+    let request = serde_json::json!({"token":"0123456789abcdef","scope":"local","idempotency_key":"after-restart","operation":{"operation":"chat","conversation_id":"c1","input":"pokaż status systemu","at_unix_ms":4,"approval":null}});
+    stream
+        .write_all(format!("{}\n", request).as_bytes())
+        .await
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["ok"],
+        true
+    );
+    let _ = shutdown_tx.send(());
+    assert!(task.await.unwrap().is_ok());
+    let store = SqliteContextStore::open(&sqlite_path).unwrap();
+    assert!(store
+        .list(&scope)
+        .unwrap()
+        .iter()
+        .any(|item| item.source.label == "conversation.turn"));
 }

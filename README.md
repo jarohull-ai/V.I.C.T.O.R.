@@ -92,6 +92,23 @@ manifestu; rekord zmieniony lub uszkodzony jest odrzucany. Rejestracja przez
 `register_into_registry` wpisuje manifest do `victor-tools::ToolRegistry`,
 więc jedyną ścieżką wykonania pozostaje `policy → runtime → executor`.
 
+## Smoke test pełnej rozmowy głosowej
+
+Deterministyczny test produkcyjnego kształtu uruchamia daemon z fixture STT,
+modelu, `plugin_sysinfo` i TTS, a następnie prowadzi WAV przez cały lokalny
+łańcuch do odpowiedzi tekstowej i audio. Nie wymaga sieci, prawdziwych modeli
+ani silników audio:
+
+```sh
+cargo test -p victor-daemon --test chat_e2e --all-features --locked \
+  -- voice_smoke_full_chain_restart_and_security
+```
+
+Test sprawdza auth, scope, replay idempotency w jednym procesie, restart i
+odtworzenie SQLite oraz brak surowego audio w context. Transportowy cache
+idempotency jest obecnie procesowy; trwała ochrona tego samego klucza po
+restarcie jest świadomie wpisana do release readiness.
+
 ## Uruchomienie
 
 ```sh
