@@ -63,6 +63,20 @@ pub struct PluginLifecycleAuditRecord {
     pub at_unix_ms: u64,
 }
 
+pub const IDEMPOTENCY_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdempotencyRecord {
+    pub key: String,
+    pub principal: String,
+    pub scope: String,
+    pub request_hash: String,
+    pub response_json: String,
+    pub status: String,
+    pub created_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+}
+
 impl SqliteContextStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::from_connection(Connection::open(path)?)
@@ -170,7 +184,27 @@ impl SqliteContextStore {
                  at_unix_ms INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_plugin_lifecycle_audit
-                 ON plugin_lifecycle_audit(plugin_id, at_unix_ms, id);",
+                 ON plugin_lifecycle_audit(plugin_id, at_unix_ms, id);
+             CREATE TABLE IF NOT EXISTS transport_idempotency (
+                 idempotency_key TEXT PRIMARY KEY,
+                 principal TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 request_hash TEXT NOT NULL,
+                 response_json TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK (status IN ('completed', 'failed')),
+                 created_at_unix_ms INTEGER NOT NULL,
+                 expires_at_unix_ms INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_transport_idempotency_expiry
+                 ON transport_idempotency(expires_at_unix_ms);
+             CREATE TABLE IF NOT EXISTS transport_audit (
+                 idempotency_key TEXT PRIMARY KEY,
+                 principal TEXT NOT NULL,
+                 scope TEXT NOT NULL,
+                 request_hash TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 at_unix_ms INTEGER NOT NULL
+             );",
         )?;
         let columns = connection
             .prepare("PRAGMA table_info(plugin_registrations)")?
@@ -197,6 +231,129 @@ impl SqliteContextStore {
             }
         }
         Ok(())
+    }
+
+    pub fn load_idempotency(
+        &self,
+        key: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<IdempotencyRecord>, StorageError> {
+        if key.is_empty() || key.len() > 256 {
+            return Err(StorageError::Invalid(
+                "klucz idempotency ma nieprawidłową długość".into(),
+            ));
+        }
+        let connection = self.lock()?;
+        connection.execute(
+            "DELETE FROM transport_idempotency WHERE expires_at_unix_ms <= ?1",
+            params![now_unix_ms],
+        )?;
+        connection
+            .query_row(
+                "SELECT idempotency_key, principal, scope, request_hash, response_json,
+                        status, created_at_unix_ms, expires_at_unix_ms
+                 FROM transport_idempotency WHERE idempotency_key = ?1",
+                params![key],
+                |row| {
+                    Ok(IdempotencyRecord {
+                        key: row.get(0)?,
+                        principal: row.get(1)?,
+                        scope: row.get(2)?,
+                        request_hash: row.get(3)?,
+                        response_json: row.get(4)?,
+                        status: row.get(5)?,
+                        created_at_unix_ms: row.get(6)?,
+                        expires_at_unix_ms: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+            .and_then(|record| {
+                let Some(record) = record else {
+                    return Ok(None);
+                };
+                if !matches!(record.status.as_str(), "completed" | "failed")
+                    || record.expires_at_unix_ms <= record.created_at_unix_ms
+                    || record.response_json.len() > IDEMPOTENCY_MAX_RESPONSE_BYTES
+                    || serde_json::from_str::<serde_json::Value>(&record.response_json).is_err()
+                {
+                    return Err(StorageError::Invalid(
+                        "uszkodzony rekord idempotency".into(),
+                    ));
+                }
+                Ok(Some(record))
+            })
+    }
+
+    pub fn save_idempotency(&self, record: &IdempotencyRecord) -> Result<(), StorageError> {
+        if record.key.is_empty()
+            || record.key.len() > 256
+            || record.principal.len() > 256
+            || record.scope.len() > 256
+            || record.request_hash.len() > 256
+            || record.response_json.len() > IDEMPOTENCY_MAX_RESPONSE_BYTES
+            || !matches!(record.status.as_str(), "completed" | "failed")
+            || record.expires_at_unix_ms <= record.created_at_unix_ms
+        {
+            return Err(StorageError::Invalid(
+                "nieprawidłowy rekord idempotency".into(),
+            ));
+        }
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO transport_idempotency
+             (idempotency_key, principal, scope, request_hash, response_json, status,
+              created_at_unix_ms, expires_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(idempotency_key) DO NOTHING",
+            params![
+                record.key,
+                record.principal,
+                record.scope,
+                record.request_hash,
+                record.response_json,
+                record.status,
+                record.created_at_unix_ms,
+                record.expires_at_unix_ms,
+            ],
+        )?;
+        if inserted == 0 {
+            return Err(StorageError::Invalid("konflikt klucza idempotency".into()));
+        }
+        transaction.execute(
+            "INSERT INTO transport_audit
+             (idempotency_key, principal, scope, request_hash, status, at_unix_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                record.key,
+                record.principal,
+                record.scope,
+                record.request_hash,
+                record.status,
+                record.created_at_unix_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn purge_idempotency(&self, now_unix_ms: u64) -> Result<usize, StorageError> {
+        let connection = self.lock()?;
+        Ok(connection.execute(
+            "DELETE FROM transport_idempotency WHERE expires_at_unix_ms <= ?1",
+            params![now_unix_ms],
+        )?)
+    }
+
+    pub fn transport_audit_count(&self) -> Result<usize, StorageError> {
+        let connection = self.lock()?;
+        Ok(
+            connection.query_row("SELECT COUNT(*) FROM transport_audit", [], |row| {
+                row.get::<_, i64>(0)
+            })? as usize,
+        )
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StorageError> {
@@ -978,6 +1135,66 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_survives_restart_and_audits_atomically() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let record = IdempotencyRecord {
+            key: "restart-key".into(),
+            principal: "principal-hash".into(),
+            scope: "local".into(),
+            request_hash: "request-hash".into(),
+            response_json: r#"{"ok":true,"result":{"value":1},"error":null}"#.into(),
+            status: "completed".into(),
+            created_at_unix_ms: 100,
+            expires_at_unix_ms: 200,
+        };
+        {
+            let store = SqliteContextStore::open(file.path()).unwrap();
+            store.save_idempotency(&record).unwrap();
+            assert_eq!(store.transport_audit_count().unwrap(), 1);
+        }
+        let restarted = SqliteContextStore::open(file.path()).unwrap();
+        assert_eq!(
+            restarted.load_idempotency("restart-key", 150).unwrap(),
+            Some(record)
+        );
+        assert_eq!(restarted.transport_audit_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn idempotency_ttl_purge_and_corrupt_records_fail_closed() {
+        let store = SqliteContextStore::in_memory().unwrap();
+        let record = IdempotencyRecord {
+            key: "ttl-key".into(),
+            principal: "p".into(),
+            scope: "s".into(),
+            request_hash: "h".into(),
+            response_json: r#"{"ok":false,"result":null,"error":"denied"}"#.into(),
+            status: "failed".into(),
+            created_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+        };
+        store.save_idempotency(&record).unwrap();
+        assert!(store.load_idempotency("ttl-key", 2).unwrap().is_none());
+        assert_eq!(store.purge_idempotency(2).unwrap(), 0);
+
+        store
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO transport_idempotency
+                 (idempotency_key, principal, scope, request_hash, response_json, status,
+                  created_at_unix_ms, expires_at_unix_ms)
+                 VALUES ('bad', 'p', 's', 'h', '{not-json}', 'completed', 1, 100)",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.load_idempotency("bad", 2),
+            Err(StorageError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn skill_decision_audit_is_persistent() {
         let file = tempfile::NamedTempFile::new().unwrap();
         {
@@ -1060,5 +1277,30 @@ mod tests {
             )
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn idempotency_store_persists_conflicts_and_ttl() {
+        let database = tempfile::NamedTempFile::new().unwrap();
+        let record = IdempotencyRecord {
+            key: "voice-1".into(),
+            principal: "principal-a".into(),
+            scope: "local".into(),
+            request_hash: "request-a".into(),
+            response_json: r#"{"ok":true,"result":{"status":"executed"},"error":null}"#.into(),
+            status: "completed".into(),
+            created_at_unix_ms: 10,
+            expires_at_unix_ms: 20,
+        };
+        let store = SqliteContextStore::open(database.path()).unwrap();
+        store.save_idempotency(&record).unwrap();
+        assert_eq!(
+            store.load_idempotency("voice-1", 19).unwrap(),
+            Some(record.clone())
+        );
+        assert!(store.save_idempotency(&record).is_err());
+        let restarted = SqliteContextStore::open(database.path()).unwrap();
+        assert_eq!(restarted.load_idempotency("voice-1", 20).unwrap(), None);
+        assert_eq!(restarted.purge_idempotency(20).unwrap(), 0);
     }
 }

@@ -1,10 +1,9 @@
 //! Lokalny transport API skills przez Unix domain socket.
 
-use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -20,10 +19,12 @@ use victor_plugin_host::{PluginLaunchRequest, PluginLifecycleApi};
 use victor_skill_api::{SkillApi, SkillApiError};
 use victor_skill_forge::ForgeRequest;
 use victor_skills::{SkillId, SkillManifest};
+use victor_storage::{IdempotencyRecord, SqliteContextStore, IDEMPOTENCY_MAX_RESPONSE_BYTES};
 
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const IDEMPOTENCY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
@@ -132,7 +133,7 @@ pub struct SkillRequest {
     pub operation: SkillOperation,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillResponse {
     pub ok: bool,
     pub result: Option<Value>,
@@ -173,15 +174,7 @@ struct ServerState {
     scope: String,
     max_request_bytes: usize,
     max_audio_bytes: usize,
-    idempotent: HashMap<String, CachedResponse>,
-}
-
-#[derive(Clone)]
-struct CachedResponse {
-    principal: String,
-    scope: String,
-    request_hash: String,
-    response: SkillResponse,
+    idempotency: Arc<SqliteContextStore>,
 }
 
 pub struct UnixSkillServer {
@@ -215,7 +208,11 @@ impl UnixSkillServer {
                 scope,
                 max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
                 max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
-                idempotent: HashMap::new(),
+                idempotency: Arc::new(SqliteContextStore::in_memory().map_err(|error| {
+                    TransportError::InvalidConfig(format!(
+                        "nie można utworzyć magazynu idempotency: {error}"
+                    ))
+                })?),
             })),
             request_timeout: DEFAULT_TIMEOUT,
         })
@@ -223,6 +220,13 @@ impl UnixSkillServer {
 
     pub fn with_plugin_api(self, plugin_api: PluginLifecycleApi) -> Self {
         self.with_plugin_api_shared(Arc::new(Mutex::new(plugin_api)))
+    }
+
+    pub fn with_idempotency_store(self, store: Arc<SqliteContextStore>) -> Self {
+        if let Ok(mut guard) = self.state.try_lock() {
+            guard.idempotency = store;
+        }
+        self
     }
 
     pub fn with_plugin_api_shared(self, plugin_api: Arc<Mutex<PluginLifecycleApi>>) -> Self {
@@ -432,6 +436,9 @@ async fn write_response(
     response: SkillResponse,
 ) -> Result<(), TransportError> {
     let mut bytes = serde_json::to_vec(&response)?;
+    if bytes.len() > IDEMPOTENCY_MAX_RESPONSE_BYTES {
+        bytes = serde_json::to_vec(&failure("odpowiedź przekracza limit transportu"))?;
+    }
     bytes.push(b'\n');
     writer.write_all(&bytes).await?;
     Ok(())
@@ -439,11 +446,6 @@ async fn write_response(
 
 async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> SkillResponse {
     let key = request.idempotency_key.clone();
-    let principal = hash_text(&request.token);
-    let request_hash = match serde_json::to_vec(&(&request.scope, &request.operation)) {
-        Ok(bytes) => hash_bytes(&bytes),
-        Err(error) => return failure(format!("nie można zhashować żądania: {error}")),
-    };
     let mut guard = state.lock().await;
     if request.token != guard.token {
         return failure("nieautoryzowany klient");
@@ -452,14 +454,36 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         return failure("odmowa scope klienta");
     }
     if let Some(key) = key.as_ref() {
-        if let Some(cached) = guard.idempotent.get(key) {
-            if cached.principal == principal
-                && cached.scope == request.scope
-                && cached.request_hash == request_hash
-            {
-                return cached.response.clone();
+        if key.is_empty() || key.len() > 256 || key.chars().any(char::is_control) {
+            return failure("nieprawidłowy klucz idempotency");
+        }
+    }
+    let principal = hash_text(&request.token);
+    let request_hash = match serde_json::to_vec(&(&request.scope, &request.operation)) {
+        Ok(bytes) => hash_bytes(&bytes),
+        Err(error) => return failure(format!("nie można zhashować żądania: {error}")),
+    };
+    if let Some(key) = key.as_ref() {
+        let now = unix_now_ms();
+        match guard.idempotency.load_idempotency(key, now) {
+            Ok(Some(record)) => {
+                if record.principal != principal
+                    || record.scope != request.scope
+                    || record.request_hash != request_hash
+                {
+                    return failure("konflikt klucza idempotency");
+                }
+                let response: SkillResponse = match serde_json::from_str(&record.response_json) {
+                    Ok(response) => response,
+                    Err(_) => return failure("uszkodzony rekord idempotency"),
+                };
+                if (record.status == "completed") != response.ok {
+                    return failure("niespójny rekord idempotency");
+                }
+                return response;
             }
-            return failure("konflikt klucza idempotency");
+            Ok(None) => {}
+            Err(_) => return failure("niedostępny store idempotency"),
         }
     }
     let result: Result<Value, String> = match request.operation {
@@ -580,17 +604,34 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
         Err(error) => failure(error.to_string()),
     };
     if let Some(key) = key {
-        guard.idempotent.insert(
+        let response_json = match serde_json::to_string(&response) {
+            Ok(response) if response.len() <= IDEMPOTENCY_MAX_RESPONSE_BYTES => response,
+            Ok(_) => return failure("odpowiedź przekracza limit transportu"),
+            Err(_) => return failure("nie można zapisać odpowiedzi idempotency"),
+        };
+        let now = unix_now_ms();
+        let record = IdempotencyRecord {
             key,
-            CachedResponse {
-                principal,
-                scope: request.scope,
-                request_hash,
-                response: response.clone(),
-            },
-        );
+            principal,
+            scope: request.scope,
+            request_hash,
+            response_json,
+            status: if response.ok { "completed" } else { "failed" }.into(),
+            created_at_unix_ms: now,
+            expires_at_unix_ms: now.saturating_add(IDEMPOTENCY_TTL.as_millis() as u64),
+        };
+        if guard.idempotency.save_idempotency(&record).is_err() {
+            return failure("nie można zapisać idempotency");
+        }
     }
     response
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn dispatch_plugin(
@@ -830,6 +871,162 @@ mod tests {
         );
         let _ = shutdown_tx.send(());
         assert!(server_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn idempotency_replays_after_restart_without_executing_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("idempotency.sqlite3");
+        let socket_path = dir.path().join("first.sock");
+        let store = Arc::new(SqliteContextStore::open(&database_path).unwrap());
+        let server = UnixSkillServer::new(
+            &socket_path,
+            "0123456789abcdef",
+            "default",
+            api_with_audit(store.clone()),
+        )
+        .unwrap()
+        .with_idempotency_store(store.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.run(shutdown_rx));
+        for _ in 0..200 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut first_request = request();
+        first_request.idempotency_key = Some("restart-replay".into());
+        let first = roundtrip(&socket_path, first_request.clone()).await;
+        assert!(first.ok);
+        assert_eq!(store.transport_audit_count().unwrap(), 1);
+        let _ = shutdown_tx.send(());
+        assert!(server_task.await.unwrap().is_ok());
+
+        let restarted_store = Arc::new(SqliteContextStore::open(&database_path).unwrap());
+        let restarted = UnixSkillServer::new(
+            dir.path().join("second.sock"),
+            "0123456789abcdef",
+            "default",
+            api_with_audit(restarted_store.clone()),
+        )
+        .unwrap()
+        .with_idempotency_store(restarted_store.clone());
+        let second_socket = restarted.socket_path().to_path_buf();
+        let (restart_shutdown_tx, restart_shutdown_rx) = oneshot::channel();
+        let restart_task = tokio::spawn(restarted.run(restart_shutdown_rx));
+        for _ in 0..200 {
+            if second_socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let replay = roundtrip(&second_socket, first_request.clone()).await;
+        assert_eq!(replay, first);
+        assert_eq!(restarted_store.transport_audit_count().unwrap(), 1);
+
+        let mut wrong_principal = SkillRequest {
+            token: "different-principal".into(),
+            ..request()
+        };
+        wrong_principal.idempotency_key = Some("restart-replay".into());
+        assert_eq!(
+            roundtrip(&second_socket, wrong_principal)
+                .await
+                .error
+                .as_deref(),
+            Some("nieautoryzowany klient")
+        );
+
+        let mut wrong_hash = first_request;
+        wrong_hash.operation = SkillOperation::List;
+        assert_eq!(
+            roundtrip(&second_socket, wrong_hash).await.error.as_deref(),
+            Some("konflikt klucza idempotency")
+        );
+
+        let mut wrong_scope = request();
+        wrong_scope.idempotency_key = Some("restart-replay".into());
+        wrong_scope.scope = "other".into();
+        assert_eq!(
+            roundtrip(&second_socket, wrong_scope)
+                .await
+                .error
+                .as_deref(),
+            Some("odmowa scope klienta")
+        );
+        let _ = restart_shutdown_tx.send(());
+        assert!(restart_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn persistent_idempotency_survives_restart_and_rejects_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persistent.sock");
+        let database_path = dir.path().join("persistent.sqlite3");
+        let database = Arc::new(SqliteContextStore::open(&database_path).unwrap());
+        let server = UnixSkillServer::new(
+            &path,
+            "0123456789abcdef",
+            "default",
+            api_with_audit(database.clone()),
+        )
+        .unwrap()
+        .with_idempotency_store(database.clone());
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let server_task = tokio::spawn(server.run(shutdown_rx));
+        for _ in 0..200 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut original = request();
+        original.idempotency_key = Some("persistent-1".into());
+        let first = roundtrip(&path, original.clone()).await;
+        assert!(first.ok);
+        assert_eq!(roundtrip(&path, original.clone()).await, first);
+
+        let mut wrong_token = original.clone();
+        wrong_token.token = "other-principal-token".into();
+        assert!(!roundtrip(&path, wrong_token).await.ok);
+        let mut wrong_scope = original.clone();
+        wrong_scope.scope = "other-scope".into();
+        assert!(!roundtrip(&path, wrong_scope).await.ok);
+        let mut conflicting = original.clone();
+        conflicting.operation = SkillOperation::List;
+        assert!(!roundtrip(&path, conflicting).await.ok);
+
+        let _ = shutdown_tx.send(());
+        assert!(server_task.await.unwrap().is_ok());
+        let before_restart = database.skill_decision_count().unwrap();
+
+        let restarted_database = Arc::new(SqliteContextStore::open(&database_path).unwrap());
+        let restart_path = dir.path().join("persistent-restart.sock");
+        let restarted = UnixSkillServer::new(
+            &restart_path,
+            "0123456789abcdef",
+            "default",
+            api_with_audit(restarted_database.clone()),
+        )
+        .unwrap()
+        .with_idempotency_store(restarted_database.clone());
+        let (restart_shutdown_tx, restart_shutdown_rx) = oneshot::channel();
+        let restart_task = tokio::spawn(restarted.run(restart_shutdown_rx));
+        for _ in 0..200 {
+            if restart_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(roundtrip(&restart_path, original).await, first);
+        assert_eq!(
+            restarted_database.skill_decision_count().unwrap(),
+            before_restart
+        );
+        let _ = restart_shutdown_tx.send(());
+        assert!(restart_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

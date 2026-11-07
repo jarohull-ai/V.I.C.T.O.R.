@@ -79,7 +79,7 @@ operatora; instalator ich nie pobiera i nie uruchamia.
 - [ ] pełny gate clean-checkout przechodzi;
 - [ ] binaria i konfiguracje release mają opublikowane SHA-256;
 - [ ] smoke test voice przechodzi na fixture bez sieci;
-- [ ] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
+- [x] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
 
 Manifest sum jest deterministyczny, sortowany po nazwie artefaktu i odrzuca
 symlinki. Generuj go dopiero po zakończeniu builda release; nie umieszczaj w nim

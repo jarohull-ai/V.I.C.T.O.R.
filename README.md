@@ -21,7 +21,7 @@ Tauri, egui i w testach.
 | `crates/victor-skills` | Deklaratywne manifesty skills: hash, JSON Schema, workflow z registry narzędzi, lifecycle, zależności i rollback |
 | `crates/victor-skill-forge` | Bezpieczny forge opisu/recipe do Draft, dry-run, policy validation i Active; bez kodu i bez nowych capabilities |
 | `crates/victor-skill-api` | Lokalny, UI-agnostyczny API list/review/lifecycle/audit dla skills; operacje są ponownie walidowane po stronie backendu |
-| `crates/victor-skill-transport` | Unix socket transport z tokenem sesji, scope, limitami, timeoutem i idempotency cache; bez nasłuchu sieciowego |
+| `crates/victor-skill-transport` | Unix socket transport z tokenem sesji, scope, limitami, timeoutem i trwałym idempotency w SQLite; bez nasłuchu sieciowego |
 | `crates/victor-skill-cli` | Referencyjny klient CLI nad Unix socketem: list/review/draft/update/approve/disable/rollback/audit |
 | `crates/victor-plugin-contract` | Wersjonowany JSON-over-stdio/JFP contract z limitem ramek i handshake |
 | `crates/victor-plugin-host` | Host procesów pluginów, sandbox boundary, restart lifecycle i trwały rejestr SQLite |
@@ -104,10 +104,11 @@ cargo test -p victor-daemon --test chat_e2e --all-features --locked \
   -- voice_smoke_full_chain_restart_and_security
 ```
 
-Test sprawdza auth, scope, replay idempotency w jednym procesie, restart i
-odtworzenie SQLite oraz brak surowego audio w context. Transportowy cache
-idempotency jest obecnie procesowy; trwała ochrona tego samego klucza po
-restarcie jest świadomie wpisana do release readiness.
+Test sprawdza auth, scope, replay idempotency w jednym procesie i po restarcie,
+odtworzenie SQLite oraz brak surowego audio w context. Daemon zapisuje rekord
+idempotency w tym samym SQLite: principal, scope, pełny hash żądania, status,
+bounded response i TTL 24 godzin. Auth i scope są sprawdzane przed lookupem;
+konflikt klucza, uszkodzony rekord i błąd store kończą się fail-closed.
 
 ## Uruchomienie
 

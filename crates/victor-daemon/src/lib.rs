@@ -435,7 +435,8 @@ impl Daemon {
             .map_err(|e| DaemonError::Transport(e.to_string()))?
             .with_plugin_api_shared(plugin_api)
             .with_conversation(conversation)
-            .with_voice(voice);
+            .with_voice(voice)
+            .with_idempotency_store(store);
         Ok(Self {
             config,
             server: Some(server),

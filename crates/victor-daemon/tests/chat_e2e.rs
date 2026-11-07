@@ -243,10 +243,10 @@ async fn voice_smoke_full_chain_restart_and_security() {
     let mut wav = vec![0_u8; 64];
     wav[0..4].copy_from_slice(b"RIFF");
     wav[8..12].copy_from_slice(b"WAVE");
-    let request = serde_json::json!({"token":"0123456789abcdef","scope":"local","idempotency_key":"voice-1","operation":{"operation":"voice","conversation_id":"voice-c1","audio":wav,"at_unix_ms":3}});
+    let voice_request = serde_json::json!({"token":"0123456789abcdef","scope":"local","idempotency_key":"voice-1","operation":{"operation":"voice","conversation_id":"voice-c1","audio":wav,"at_unix_ms":3}});
     reader
         .get_mut()
-        .write_all(format!("{}\n", request).as_bytes())
+        .write_all(format!("{}\n", voice_request).as_bytes())
         .await
         .unwrap();
     line.clear();
@@ -260,14 +260,14 @@ async fn voice_smoke_full_chain_restart_and_security() {
     let first_voice_response = response.clone();
     reader
         .get_mut()
-        .write_all(format!("{}\n", request).as_bytes())
+        .write_all(format!("{}\n", voice_request).as_bytes())
         .await
         .unwrap();
     line.clear();
     reader.read_line(&mut line).await.unwrap();
     let replay: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(replay, first_voice_response);
-    let mut unauthorized = request.clone();
+    let mut unauthorized = voice_request.clone();
     unauthorized["token"] = serde_json::json!("wrong-token-123456");
     reader
         .get_mut()
@@ -280,7 +280,7 @@ async fn voice_smoke_full_chain_restart_and_security() {
         serde_json::from_str::<serde_json::Value>(&line).unwrap()["ok"],
         false
     );
-    let mut wrong_scope = request.clone();
+    let mut wrong_scope = voice_request.clone();
     wrong_scope["scope"] = serde_json::json!("other");
     reader
         .get_mut()
@@ -296,7 +296,8 @@ async fn voice_smoke_full_chain_restart_and_security() {
     let _ = shutdown_tx.send(());
     assert!(task.await.unwrap().is_ok());
     let store = SqliteContextStore::open(&sqlite_path).unwrap();
-    assert!(store.audit_count().unwrap() >= 3);
+    let audit_before_restart = store.audit_count().unwrap();
+    assert!(audit_before_restart >= 3);
     let scope = ContextScope::conversation("local.voice-c1").unwrap();
     let items = store.list(&scope).unwrap();
     assert!(items.iter().all(|item| match &item.content {
@@ -324,7 +325,7 @@ async fn voice_smoke_full_chain_restart_and_security() {
             )
         }
     };
-    let request = serde_json::json!({"token":"0123456789abcdef","scope":"local","idempotency_key":"after-restart","operation":{"operation":"chat","conversation_id":"c1","input":"pokaż status systemu","at_unix_ms":4,"approval":null}});
+    let request = voice_request;
     stream
         .write_all(format!("{}\n", request).as_bytes())
         .await
@@ -332,13 +333,12 @@ async fn voice_smoke_full_chain_restart_and_security() {
     let mut reader = BufReader::new(stream);
     line.clear();
     reader.read_line(&mut line).await.unwrap();
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&line).unwrap()["ok"],
-        true
-    );
+    let replay_after_restart: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(replay_after_restart, first_voice_response);
     let _ = shutdown_tx.send(());
     assert!(task.await.unwrap().is_ok());
     let store = SqliteContextStore::open(&sqlite_path).unwrap();
+    assert_eq!(store.audit_count().unwrap(), audit_before_restart);
     assert!(store
         .list(&scope)
         .unwrap()

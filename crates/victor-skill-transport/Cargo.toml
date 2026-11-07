@@ -19,10 +19,10 @@ victor-domain = { path = "../victor-domain" }
 victor-conversation = { path = "../victor-conversation" }
 victor-plugin-host = { path = "../victor-plugin-host" }
 victor-tools = { path = "../victor-tools" }
+victor-storage = { path = "../victor-storage" }
 
 [dev-dependencies]
 tempfile.workspace = true
 victor-domain = { path = "../victor-domain" }
 victor-policy = { path = "../victor-policy" }
-victor-storage = { path = "../victor-storage" }
 victor-tools = { path = "../victor-tools" }
