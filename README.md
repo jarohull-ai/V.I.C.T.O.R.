@@ -23,6 +23,8 @@ Tauri, egui i w testach.
 | `crates/victor-skill-api` | Lokalny, UI-agnostyczny API list/review/lifecycle/audit dla skills; operacje są ponownie walidowane po stronie backendu |
 | `crates/victor-skill-transport` | Unix socket transport z tokenem sesji, scope, limitami, timeoutem i idempotency cache; bez nasłuchu sieciowego |
 | `crates/victor-skill-cli` | Referencyjny klient CLI nad Unix socketem: list/review/draft/update/approve/disable/rollback/audit |
+| `crates/victor-plugin-contract` | Wersjonowany JSON-over-stdio/JFP contract z limitem ramek i handshake |
+| `crates/victor-plugin-host` | Host procesów pluginów, sandbox boundary, restart lifecycle i trwały rejestr SQLite |
 
 Decyzje o reuse: [`docs/ADR-001-reuse.md`](docs/ADR-001-reuse.md).
 
@@ -48,6 +50,12 @@ Awaria, timeout, rozłączenie lub błędny framing zamykają stdin/stdout i ko�
 proces przez `kill` + `wait`. Limit ramki działa także przed otrzymaniem newline,
 więc bufor nie rośnie bez ograniczeń. Restart jest limitowany do jednej próby i
 może zapisać zdarzenie `Failed` do `AuditSink`.
+
+`PersistentPluginHost` odtwarza po restarcie wyłącznie aktywne rejestracje z
+SQLite. Przed uruchomieniem sprawdza identyfikator oraz SHA-256 lokalnego
+manifestu; rekord zmieniony lub uszkodzony jest odrzucany. Rejestracja przez
+`register_into_registry` wpisuje manifest do `victor-tools::ToolRegistry`,
+więc jedyną ścieżką wykonania pozostaje `policy → runtime → executor`.
 
 ## Uruchomienie
 
@@ -210,8 +218,8 @@ cargo fmt --all --check
 - UI rozmowy i wybór konfiguracji hosta — runtime ma już pętlę
   `AudioChunk → adapter → Transcript → victor-context`, ale nie ma jeszcze
   aplikacji `apps/` ani interfejsu użytkownika.
-- Pierwszego produkcyjnego narzędzia read-only — adapter `victor-fetch-bald` ma
-  już kontrakt i executor, ale nie jest jeszcze podłączony do aplikacji hostującej.
+- Integracji `victor-fetch-bald` z aplikacją hostującą; `plugin_sysinfo` jest
+  pierwszym podłączonym pluginem demonstracyjnym.
 - Konwersji audio do WAV 16 kHz mono — celowo jej nie ma; użytkownik musi
   dostarczyć poprawny plik albo jawnie włączyć przyszły konwerter.
 - Podłączenia adaptera BALD do aplikacji hostującej i produkcyjnego audytu

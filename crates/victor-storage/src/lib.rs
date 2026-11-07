@@ -31,6 +31,16 @@ pub struct SqliteContextStore {
     connection: Mutex<Connection>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginRegistrationRecord {
+    pub plugin_id: String,
+    pub manifest_json: String,
+    pub manifest_hash: String,
+    pub command: Vec<String>,
+    pub sandbox_required: bool,
+    pub status: String,
+}
+
 impl SqliteContextStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         Self::from_connection(Connection::open(path)?)
@@ -109,6 +119,14 @@ impl SqliteContextStore {
              CREATE TABLE IF NOT EXISTS skill_registry (
                  id INTEGER PRIMARY KEY CHECK (id = 1),
                  snapshot TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS plugin_registrations (
+                 plugin_id TEXT PRIMARY KEY,
+                 manifest_json TEXT NOT NULL,
+                 manifest_hash TEXT NOT NULL,
+                 command_json TEXT NOT NULL,
+                 sandbox_required INTEGER NOT NULL CHECK (sandbox_required IN (0, 1)),
+                 status TEXT NOT NULL CHECK (status IN ('active', 'disabled'))
              );",
         )?;
         Ok(())
@@ -134,6 +152,81 @@ impl SqliteContextStore {
                 row.get::<_, i64>(0)
             })? as usize,
         )
+    }
+
+    pub fn save_plugin_registration(
+        &self,
+        record: &PluginRegistrationRecord,
+    ) -> Result<(), StorageError> {
+        let command_json = serde_json::to_string(&record.command)
+            .map_err(|error| StorageError::Invalid(error.to_string()))?;
+        let connection = self.lock()?;
+        connection.execute(
+            "INSERT INTO plugin_registrations
+             (plugin_id, manifest_json, manifest_hash, command_json, sandbox_required, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(plugin_id) DO UPDATE SET
+               manifest_json=excluded.manifest_json,
+               manifest_hash=excluded.manifest_hash,
+               command_json=excluded.command_json,
+               sandbox_required=excluded.sandbox_required,
+               status=excluded.status",
+            params![
+                record.plugin_id,
+                record.manifest_json,
+                record.manifest_hash,
+                command_json,
+                i64::from(record.sandbox_required),
+                record.status,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_plugin_status(&self, plugin_id: &str, status: &str) -> Result<(), StorageError> {
+        if !matches!(status, "active" | "disabled") {
+            return Err(StorageError::Invalid("nieznany status pluginu".into()));
+        }
+        let connection = self.lock()?;
+        let changed = connection.execute(
+            "UPDATE plugin_registrations SET status = ?1 WHERE plugin_id = ?2",
+            params![status, plugin_id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Invalid(
+                "plugin nie jest zarejestrowany".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn plugin_registrations(&self) -> Result<Vec<PluginRegistrationRecord>, StorageError> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            "SELECT plugin_id, manifest_json, manifest_hash, command_json,
+                    sandbox_required, status
+             FROM plugin_registrations ORDER BY plugin_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let command_json: String = row.get(3)?;
+            let command = serde_json::from_str(&command_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(PluginRegistrationRecord {
+                plugin_id: row.get(0)?,
+                manifest_json: row.get(1)?,
+                manifest_hash: row.get(2)?,
+                command,
+                sandbox_required: row.get::<_, i64>(4)? != 0,
+                status: row.get(5)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     fn put_in_transaction(
@@ -707,6 +800,32 @@ mod tests {
         }
         let restarted = SqliteContextStore::open(file.path()).unwrap();
         assert_eq!(restarted.skill_decision_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn plugin_registration_and_disabled_status_survive_restart() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let record = PluginRegistrationRecord {
+            plugin_id: "plugin_sysinfo".into(),
+            manifest_json: "{\"manifest\":true}".into(),
+            manifest_hash: "sha256:test".into(),
+            command: vec!["plugin_sysinfo".into(), "normal".into()],
+            sandbox_required: false,
+            status: "active".into(),
+        };
+        {
+            let store = SqliteContextStore::open(file.path()).unwrap();
+            store.save_plugin_registration(&record).unwrap();
+            assert_eq!(store.plugin_registrations().unwrap(), vec![record.clone()]);
+            store
+                .set_plugin_status("plugin_sysinfo", "disabled")
+                .unwrap();
+        }
+        let restarted = SqliteContextStore::open(file.path()).unwrap();
+        let registrations = restarted.plugin_registrations().unwrap();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].plugin_id, "plugin_sysinfo");
+        assert_eq!(registrations[0].status, "disabled");
     }
 
     #[test]

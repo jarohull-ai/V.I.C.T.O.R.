@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -20,6 +21,7 @@ use victor_plugin_contract::{
     decode_frame, encode, Hello, PluginManifest, Request, Response, WireMessage,
     DEFAULT_HEARTBEAT_TIMEOUT_MS, DEFAULT_REQUEST_TIMEOUT_MS, MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
+use victor_storage::{PluginRegistrationRecord, SqliteContextStore};
 use victor_tools::{
     AuditOutcome, AuditSink, ToolAuditEvent, ToolError, ToolExecution, ToolExecutor, ToolManifest,
 };
@@ -269,14 +271,55 @@ impl PluginHost {
         command: Vec<String>,
         manifest: ToolManifest,
     ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        self.register_with_policy(command, manifest, PluginLaunchPolicy::default(), None)
+            .await
+    }
+
+    pub async fn register_with_policy(
+        &mut self,
+        command: Vec<String>,
+        manifest: ToolManifest,
+        launch_policy: PluginLaunchPolicy,
+        audit: Option<Arc<dyn AuditSink>>,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
         let id = manifest.descriptor.id.as_str().to_string();
         if self.tools.contains_key(&id) {
             return Err(HostError::ManifestMismatch(format!(
                 "narzędzie {id} jest już zarejestrowane"
             )));
         }
-        let executor = Arc::new(PluginToolExecutor::spawn(command, manifest).await?);
+        let executor = Arc::new(
+            PluginToolExecutor::spawn_with_policy(command, manifest, launch_policy, audit).await?,
+        );
         self.tools.insert(id, executor.clone());
+        Ok(executor)
+    }
+
+    /// Rejestruje executor i lokalny manifest w tej samej ścieżce, z której
+    /// runtime pobiera capabilities oraz risk. Plugin nie może rozszerzyć
+    /// tego manifestu przez własny handshake.
+    pub async fn register_into_registry(
+        &mut self,
+        command: Vec<String>,
+        manifest: ToolManifest,
+        launch_policy: PluginLaunchPolicy,
+        audit: Option<Arc<dyn AuditSink>>,
+        registry: &mut victor_tools::ToolRegistry,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let id = manifest.descriptor.id.clone();
+        if registry.get(&id).is_some() {
+            return Err(HostError::ManifestMismatch(format!(
+                "narzędzie {} jest już w rejestrze runtime",
+                id
+            )));
+        }
+        let executor = self
+            .register_with_policy(command, manifest.clone(), launch_policy, audit)
+            .await?;
+        if let Err(error) = registry.register(manifest) {
+            self.tools.remove(id.as_str());
+            return Err(HostError::ManifestMismatch(error.to_string()));
+        }
         Ok(executor)
     }
 
@@ -290,6 +333,147 @@ impl PluginHost {
             .filter_map(|id| ToolId::parse(id).ok())
             .collect()
     }
+}
+
+/// Rejestr pluginów związany z SQLite. Przy starcie uruchamia tylko rekordy
+/// `active`; manifest jest deserializowany i hashowany przed wykonaniem komendy.
+pub struct PersistentPluginHost {
+    host: PluginHost,
+    store: Arc<SqliteContextStore>,
+    audit: Option<Arc<dyn AuditSink>>,
+}
+
+impl PersistentPluginHost {
+    pub async fn open(
+        store: Arc<SqliteContextStore>,
+        audit: Option<Arc<dyn AuditSink>>,
+    ) -> Result<Self, HostError> {
+        let mut persistent = Self {
+            host: PluginHost::new(),
+            store,
+            audit,
+        };
+        for record in persistent
+            .store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+        {
+            if record.status != "active" {
+                continue;
+            }
+            let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+            if manifest.descriptor.id.as_str() != record.plugin_id
+                || manifest_hash(&manifest)? != record.manifest_hash
+            {
+                return Err(HostError::ManifestMismatch(format!(
+                    "hash lub identyfikator pluginu {} nie pasuje do SQLite",
+                    record.plugin_id
+                )));
+            }
+            let policy = PluginLaunchPolicy {
+                sandbox: if record.sandbox_required {
+                    SandboxRequirement::Required
+                } else {
+                    SandboxRequirement::NotRequired
+                },
+                ..PluginLaunchPolicy::default()
+            };
+            persistent
+                .host
+                .register_with_policy(record.command, manifest, policy, persistent.audit.clone())
+                .await?;
+        }
+        Ok(persistent)
+    }
+
+    pub async fn register(
+        &mut self,
+        command: Vec<String>,
+        manifest: ToolManifest,
+        launch_policy: PluginLaunchPolicy,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let plugin_id = manifest.descriptor.id.as_str().to_string();
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        let executor = self
+            .host
+            .register_with_policy(
+                command.clone(),
+                manifest.clone(),
+                launch_policy.clone(),
+                self.audit.clone(),
+            )
+            .await?;
+        self.store
+            .save_plugin_registration(&PluginRegistrationRecord {
+                plugin_id,
+                manifest_json,
+                manifest_hash: manifest_hash(&manifest)?,
+                command,
+                sandbox_required: matches!(launch_policy.sandbox, SandboxRequirement::Required),
+                status: "active".into(),
+            })
+            .map_err(storage_host_error)?;
+        Ok(executor)
+    }
+
+    pub async fn register_into_registry(
+        &mut self,
+        command: Vec<String>,
+        manifest: ToolManifest,
+        launch_policy: PluginLaunchPolicy,
+        registry: &mut victor_tools::ToolRegistry,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let id = manifest.descriptor.id.clone();
+        if registry.get(&id).is_some() {
+            return Err(HostError::ManifestMismatch(format!(
+                "narzędzie {} jest już w rejestrze runtime",
+                id
+            )));
+        }
+        let executor = self
+            .register(command, manifest.clone(), launch_policy)
+            .await?;
+        if let Err(error) = registry.register(manifest) {
+            self.host.tools.remove(id.as_str());
+            let _ = self.store.set_plugin_status(id.as_str(), "disabled");
+            return Err(HostError::ManifestMismatch(error.to_string()));
+        }
+        Ok(executor)
+    }
+
+    pub fn get(&self, id: &ToolId) -> Option<Arc<PluginToolExecutor>> {
+        self.host.get(id)
+    }
+
+    pub fn tool_ids(&self) -> Vec<ToolId> {
+        self.host.tool_ids()
+    }
+
+    pub fn disable(&mut self, id: &ToolId) -> Result<(), HostError> {
+        self.host.tools.remove(id.as_str());
+        self.store
+            .set_plugin_status(id.as_str(), "disabled")
+            .map_err(storage_host_error)
+    }
+}
+
+fn storage_host_error(error: impl std::fmt::Display) -> HostError {
+    HostError::Spawn(format!("storage pluginu: {error}"))
+}
+
+fn manifest_hash(manifest: &ToolManifest) -> Result<String, HostError> {
+    let bytes = serde_json::to_vec(manifest)
+        .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!(
+        "sha256:{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 impl PluginToolExecutor {

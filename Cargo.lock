@@ -1923,6 +1923,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1931,6 +1932,7 @@ dependencies = [
  "victor-plugin-contract",
  "victor-policy",
  "victor-runtime",
+ "victor-storage",
  "victor-tools",
 ]
 
@@ -2044,6 +2046,7 @@ name = "victor-storage"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "victor-context",

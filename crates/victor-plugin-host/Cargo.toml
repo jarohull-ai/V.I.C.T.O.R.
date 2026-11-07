@@ -7,11 +7,13 @@ license.workspace = true
 [dependencies]
 async-trait.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process"] }
 victor-domain = { path = "../victor-domain" }
 victor-plugin-contract = { path = "../victor-plugin-contract" }
 victor-tools = { path = "../victor-tools" }
+victor-storage = { path = "../victor-storage" }
 
 [dev-dependencies]
 tempfile.workspace = true

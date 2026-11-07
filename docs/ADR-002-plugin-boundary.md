@@ -25,6 +25,13 @@ starego procesu. Restart może zostać zapisany w `AuditSink`. Każde udane
 wykonanie pozostaje w standardowym przepływie runtime:
 manifest → policy → executor → context + audit.
 
+`PersistentPluginHost` przechowuje lokalny `ToolManifest`, jego SHA-256,
+komendę, wymaganie sandboxa i status `active`/`disabled` w SQLite. Przy
+restarcie host odtwarza wyłącznie aktywne wpisy i odmawia startu, gdy JSON,
+identyfikator lub hash manifestu nie pasują. Po rejestracji executor jest
+również wpisywany do `ToolRegistry`; plugin nie ma osobnej ścieżki omijającej
+policy.
+
 ### Granica sandboxa
 
 `PluginLaunchPolicy` rozróżnia plugin niewymagający izolacji od pluginu, który
