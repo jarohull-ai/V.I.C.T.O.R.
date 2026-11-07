@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bse-fetch = { path = "../../../../../BALD SEARCH ENGINE/crates/bse-fetch" }
+bse-fetch = { git = "https://github.com/jarohull-ai/BALD-ENGINE.git", rev = "8bc13b9" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
