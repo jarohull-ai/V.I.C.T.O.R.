@@ -1,6 +1,7 @@
 # V.I.C.T.O.R. — release readiness
 
-Aktualny kandydat: `v0.1.0-rc.2` na HEAD po końcowej weryfikacji. Istniejący
+Aktualny kandydat: `v0.1.0-rc.2` na zweryfikowanym commicie kodu
+`86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`. Istniejący
 `v0.1.0-rc.1` wskazuje bez zmian `cd4a326ddeba8cba5fbb51192be3f89575620ced`.
 
 ## Clean checkout gate
@@ -89,8 +90,8 @@ operatora; instalator ich nie pobiera i nie uruchamia.
 Po akceptacji właściciela, bez force push:
 
 ```sh
-git rev-parse HEAD
-git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" HEAD
+git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
+git push origin v0.1.0-rc.2
 ```
 
 Nie tworzyć taga ani GitHub Release automatycznie.
