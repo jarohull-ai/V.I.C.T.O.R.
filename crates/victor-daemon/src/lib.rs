@@ -50,6 +50,7 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub runtime_dir: PathBuf,
     pub trusted_definitions_dir: PathBuf,
+    pub allowed_roots: Vec<PathBuf>,
     pub token_file: PathBuf,
     pub scope: String,
 }
@@ -71,6 +72,13 @@ impl DaemonConfig {
         }
         if !self.token_file.is_absolute() {
             return Err(DaemonError::Config("token file musi być absolutny".into()));
+        }
+        if self.allowed_roots.is_empty()
+            || self.allowed_roots.iter().any(|path| !path.is_absolute())
+        {
+            return Err(DaemonError::Config(
+                "wymagany jest co najmniej jeden absolutny allowed root".into(),
+            ));
         }
         Ok(())
     }
@@ -95,6 +103,9 @@ impl Daemon {
         ensure_parent_safe(&config.socket_path, &config.runtime_dir, "socket")?;
         ensure_database_path(&config.sqlite_path)?;
         ensure_directory(&config.trusted_definitions_dir)?;
+        for root in &config.allowed_roots {
+            ensure_allowed_root(root)?;
+        }
         let token = load_token(&config)?;
         let definitions = load_definitions(&config.trusted_definitions_dir)?;
 
@@ -116,11 +127,7 @@ impl Daemon {
         }
         let policy = Arc::new(
             PolicyEngine::new(
-                PolicyConfig::new(vec![
-                    config.runtime_dir.clone(),
-                    config.trusted_definitions_dir.clone(),
-                ])
-                .with_enabled_tools(enabled),
+                PolicyConfig::new(config.allowed_roots.clone()).with_enabled_tools(enabled),
             )
             .map_err(|e| DaemonError::Policy(e.to_string()))?,
         );
@@ -232,6 +239,22 @@ fn ensure_directory(path: &Path) -> Result<(), DaemonError> {
     if !meta.is_dir() || meta.uid() != uid() || meta.permissions().mode() & 0o077 != 0 {
         return Err(DaemonError::Config(format!(
             "niebezpieczny katalog: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_allowed_root(path: &Path) -> Result<(), DaemonError> {
+    let meta = fs::symlink_metadata(path)
+        .map_err(|e| DaemonError::Config(format!("{}: {e}", path.display())))?;
+    if !meta.is_dir()
+        || meta.file_type().is_symlink()
+        || meta.uid() != uid()
+        || meta.permissions().mode() & 0o022 != 0
+    {
+        return Err(DaemonError::Config(format!(
+            "niebezpieczny allowed root: {}",
             path.display()
         )));
     }
@@ -361,7 +384,13 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
             .to_owned();
         if !matches!(
             key.as_str(),
-            "sqlite" | "socket" | "runtime-dir" | "trusted-definitions" | "token-file" | "scope"
+            "sqlite"
+                | "socket"
+                | "runtime-dir"
+                | "trusted-definitions"
+                | "token-file"
+                | "allowed-root"
+                | "scope"
         ) {
             return Err(DaemonError::Config(format!("nieznany argument --{key}")));
         }
@@ -384,6 +413,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
         socket_path: required("socket")?.into(),
         runtime_dir: required("runtime-dir")?.into(),
         trusted_definitions_dir: required("trusted-definitions")?.into(),
+        allowed_roots: vec![required("allowed-root")?.into()],
         token_file: required("token-file")?.into(),
         scope: values
             .get("scope")
@@ -407,10 +437,19 @@ mod tests {
             socket_path: root.path().join("run/sock"),
             runtime_dir: root.path().join("run"),
             trusted_definitions_dir: root.path().join("defs"),
+            allowed_roots: vec![root.path().to_path_buf()],
             token_file: "token".into(),
             scope: "local".into(),
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_insecure_allowed_root() {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(ensure_allowed_root(root.path()).is_err());
     }
 
     #[tokio::test]
@@ -420,6 +459,7 @@ mod tests {
         let defs = root.path().join("definitions");
         fs::create_dir(&runtime).unwrap();
         fs::create_dir(&defs).unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(&defs, fs::Permissions::from_mode(0o700)).unwrap();
         let token_path = root.path().join("token");
@@ -435,6 +475,7 @@ mod tests {
             socket_path: runtime.join("victor.sock"),
             runtime_dir: runtime,
             trusted_definitions_dir: defs,
+            allowed_roots: vec![root.path().to_path_buf()],
             token_file: token_path,
             scope: "local".into(),
         })
