@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 libc.workspace = true
 sha2.workspace = true
 serde.workspace = true
@@ -22,6 +23,8 @@ victor-storage = { path = "../victor-storage" }
 victor-tools = { path = "../victor-tools" }
 victor-runtime = { path = "../victor-runtime" }
 victor-model-local = { path = "../victor-model-local" }
+victor-integrations = { path = "../victor-integrations" }
+victor-context = { path = "../victor-context" }
 
 [dev-dependencies]
 tempfile.workspace = true

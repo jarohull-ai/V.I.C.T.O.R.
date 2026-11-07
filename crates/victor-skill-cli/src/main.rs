@@ -13,7 +13,7 @@ use victor_skill_transport::{PluginOperation, SkillOperation, SkillRequest, Skil
 use victor_skills::{SkillId, SkillManifest};
 
 fn usage() -> &'static str {
-    "victor-skill --socket PATH --token TOKEN --scope SCOPE <chat|list|review|draft|update|approve|disable|rollback|audit|plugin> [args]"
+    "victor-skill --socket PATH --token TOKEN --scope SCOPE <chat|voice|list|review|draft|update|approve|disable|rollback|audit|plugin> [args]"
 }
 
 fn main() {
@@ -87,6 +87,20 @@ fn build_operation(name: &str, args: &[String]) -> Result<SkillOperation, String
                 input,
                 at_unix_ms,
                 approval: None,
+            })
+        }
+        "voice" | "transcribe" => {
+            let conversation_id = args.first().ok_or("voice wymaga CONVERSATION_ID")?.clone();
+            let path = args.get(1).ok_or("voice wymaga ścieżki WAV")?;
+            let at_unix_ms = named_arg(args, "--at")
+                .ok_or("voice wymaga --at UNIX_MS")?
+                .parse()
+                .map_err(|_| "--at musi być liczbą UNIX_MS")?;
+            let audio = fs::read(path).map_err(|e| format!("odczyt {path}: {e}"))?;
+            Ok(SkillOperation::Voice {
+                conversation_id,
+                audio,
+                at_unix_ms,
             })
         }
         "plugin" => Ok(SkillOperation::Plugin {

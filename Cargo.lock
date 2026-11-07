@@ -1892,6 +1892,7 @@ dependencies = [
 name = "victor-daemon"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "serde",
  "serde_json",
@@ -1899,8 +1900,10 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "victor-context",
  "victor-conversation",
  "victor-domain",
+ "victor-integrations",
  "victor-model-local",
  "victor-plugin-contract",
  "victor-plugin-host",
@@ -2075,6 +2078,7 @@ dependencies = [
 name = "victor-skill-transport"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "libc",
  "serde",
  "serde_json",

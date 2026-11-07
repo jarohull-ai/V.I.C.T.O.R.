@@ -6,20 +6,23 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
+use victor_context::ContextItemId;
 use victor_conversation::{
     ConversationEngine, ConversationLimits, ConversationRouter, ConversationService,
 };
 use victor_domain::ToolId;
+use victor_integrations::{WhisperCppConfig, WhisperCppSpeechToText};
 use victor_model_local::{LocalModel, LocalModelConfig};
 use victor_plugin_host::{PluginLaunchPolicy, PluginLaunchRequest, PluginLifecycleApi};
 use victor_policy::{PolicyConfig, PolicyEngine};
-use victor_runtime::ToolRuntime;
+use victor_runtime::{SttJob, SttRuntime, ToolRuntime};
 use victor_skill_api::SkillApi;
-use victor_skill_transport::UnixSkillServer;
+use victor_skill_transport::{UnixSkillServer, VoiceService};
 use victor_storage::SqliteContextStore;
 use victor_tools::{ToolManifest, ToolRegistry};
 
@@ -55,6 +58,7 @@ pub struct DaemonConfig {
     pub token_file: PathBuf,
     pub scope: String,
     pub local_model_definition: PathBuf,
+    pub local_stt_definition: PathBuf,
 }
 
 impl DaemonConfig {
@@ -78,6 +82,11 @@ impl DaemonConfig {
         if !self.local_model_definition.is_absolute() {
             return Err(DaemonError::Config(
                 "local model definition musi być absolutna".into(),
+            ));
+        }
+        if !self.local_stt_definition.is_absolute() {
+            return Err(DaemonError::Config(
+                "local STT definition musi być absolutna".into(),
             ));
         }
         if self.allowed_roots.is_empty()
@@ -119,6 +128,86 @@ pub struct TrustedLocalModelDefinition {
     pub spec: TrustedLocalModelSpec,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedLocalSttSpec {
+    pub executable: String,
+    pub model: String,
+    pub language: Option<String>,
+    pub threads: Option<u16>,
+    pub timeout_ms: u64,
+    pub max_wav_bytes: usize,
+    pub working_dir: String,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    pub sandbox_required: bool,
+    pub sandbox_executable: Option<String>,
+    pub executable_sha256: String,
+    pub model_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustedLocalSttDefinition {
+    pub config_sha256: String,
+    pub spec: TrustedLocalSttSpec,
+}
+
+struct DaemonVoiceService {
+    stt: SttRuntime<WhisperCppSpeechToText>,
+    conversation: Arc<dyn ConversationService>,
+}
+
+#[async_trait]
+impl VoiceService for DaemonVoiceService {
+    async fn transcribe_and_chat(
+        &self,
+        conversation_id: String,
+        scope: String,
+        audio: Vec<u8>,
+        at_unix_ms: u64,
+    ) -> Result<serde_json::Value, String> {
+        let audio = victor_integrations::AudioChunk {
+            bytes: audio,
+            format: victor_integrations::AudioFormat::Wav,
+            sample_rate_hz: 16_000,
+            channels: 1,
+        };
+        let audio_hash = audio.sha256();
+        let item_id = ContextItemId::parse(&format!("stt-{}", &audio_hash[..16]))
+            .map_err(|e| e.to_string())?;
+        let context_scope =
+            victor_context::ContextScope::conversation(format!("{scope}.{conversation_id}"))
+                .map_err(|e| e.to_string())?;
+        let outcome = self
+            .stt
+            .transcribe(SttJob {
+                item_id,
+                scope: context_scope,
+                audio,
+                now_unix_ms: at_unix_ms,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let reply = self
+            .conversation
+            .chat(
+                conversation_id,
+                scope,
+                outcome.transcript.text.clone(),
+                at_unix_ms,
+                None,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "transcript": outcome.transcript.text,
+            "provider": outcome.transcript.provider,
+            "location": outcome.transcript.location,
+            "audio_sha256": audio_hash,
+            "conversation": reply
+        }))
+    }
+}
+
 pub struct Daemon {
     config: DaemonConfig,
     server: Option<UnixSkillServer>,
@@ -137,6 +226,7 @@ impl Daemon {
         let token = load_token(&config)?;
         let definitions = load_definitions(&config.trusted_definitions_dir)?;
         let model_definition = load_local_model_definition(&config)?;
+        let stt_definition = load_local_stt_definition(&config)?;
 
         let store = Arc::new(
             SqliteContextStore::open(&config.sqlite_path)
@@ -198,6 +288,13 @@ impl Daemon {
         }
         let plugin_api = Arc::new(Mutex::new(plugin_api));
         let runtime_registry = Arc::new(runtime_registry);
+        let stt = SttRuntime::new(
+            WhisperCppSpeechToText::new(stt_definition_to_config(&stt_definition)?)
+                .map_err(|e| DaemonError::Config(e.to_string()))?,
+            policy.clone(),
+            store.clone(),
+            Default::default(),
+        );
         let runtime = Arc::new(
             ToolRuntime::new(
                 runtime_registry.clone(),
@@ -232,10 +329,17 @@ impl Daemon {
             store.clone(),
             ConversationLimits::default(),
         ));
+        let voice = Arc::new(DaemonVoiceService {
+            stt,
+            conversation: conversation.clone(),
+        });
         let server = UnixSkillServer::new(&config.socket_path, token, &config.scope, skill_api)
             .map_err(|e| DaemonError::Transport(e.to_string()))?
+            .with_audio_limit(stt_definition.spec.max_wav_bytes)
+            .map_err(|e| DaemonError::Transport(e.to_string()))?
             .with_plugin_api_shared(plugin_api)
-            .with_conversation(conversation);
+            .with_conversation(conversation)
+            .with_voice(voice);
         Ok(Self {
             config,
             server: Some(server),
@@ -390,7 +494,10 @@ fn load_definitions(dir: &Path) -> Result<Vec<TrustedPluginDefinition>, DaemonEr
     let mut result = Vec::new();
     for entry in entries {
         let path = entry.path();
-        if path.file_name().and_then(|name| name.to_str()) == Some("local-model.json") {
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("local-model.json" | "local-stt.json")
+        ) {
             continue;
         }
         let meta = fs::symlink_metadata(&path)?;
@@ -506,6 +613,90 @@ fn load_local_model_definition(
     Ok(definition)
 }
 
+fn load_local_stt_definition(
+    config: &DaemonConfig,
+) -> Result<TrustedLocalSttDefinition, DaemonError> {
+    let path = &config.local_stt_definition;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_file()
+        || meta.file_type().is_symlink()
+        || meta.uid() != uid()
+        || meta.permissions().mode() & 0o022 != 0
+        || path.parent() != Some(config.trusted_definitions_dir.as_path())
+    {
+        return Err(DaemonError::Config(
+            "niebezpieczna definicja lokalnego STT".into(),
+        ));
+    }
+    let definition: TrustedLocalSttDefinition = serde_json::from_reader(File::open(path)?)?;
+    if hash_bytes(&serde_json::to_vec(&definition.spec)?) != definition.config_sha256 {
+        return Err(DaemonError::Config(
+            "hash trusted config lokalnego STT nie pasuje".into(),
+        ));
+    }
+    let executable = Path::new(&definition.spec.executable);
+    let model = Path::new(&definition.spec.model);
+    let working_dir = Path::new(&definition.spec.working_dir);
+    if !executable.is_absolute()
+        || !model.is_absolute()
+        || !working_dir.is_absolute()
+        || !safe_owned_file(executable)
+        || !safe_owned_file(model)
+        || !safe_owned_directory(working_dir)
+        || hash_file(executable)? != definition.spec.executable_sha256
+        || hash_file(model)? != definition.spec.model_sha256
+        || definition.spec.timeout_ms == 0
+        || definition.spec.max_wav_bytes == 0
+    {
+        return Err(DaemonError::Config(
+            "niebezpieczna lub niekompletna konfiguracja lokalnego STT".into(),
+        ));
+    }
+    if definition.spec.environment.keys().any(|key| {
+        let key = key.to_ascii_lowercase();
+        ["secret", "token", "password", "api_key", "private_key"]
+            .iter()
+            .any(|marker| key.contains(marker))
+    }) {
+        return Err(DaemonError::Config(
+            "środowisko lokalnego STT zawiera nazwę sekretu".into(),
+        ));
+    }
+    if definition.spec.sandbox_required {
+        let sandbox = definition
+            .spec
+            .sandbox_executable
+            .as_deref()
+            .map(Path::new)
+            .ok_or_else(|| DaemonError::Config("STT wymaga jawnego sandbox executable".into()))?;
+        if !sandbox.is_absolute() || !safe_owned_file(sandbox) {
+            return Err(DaemonError::Config("niebezpieczny sandbox STT".into()));
+        }
+    }
+    Ok(definition)
+}
+
+fn stt_definition_to_config(
+    definition: &TrustedLocalSttDefinition,
+) -> Result<WhisperCppConfig, DaemonError> {
+    let spec = &definition.spec;
+    let mut config = WhisperCppConfig::new(&spec.executable, &spec.model)
+        .with_timeout(std::time::Duration::from_millis(spec.timeout_ms))
+        .with_working_dir(&spec.working_dir)
+        .with_environment(spec.environment.clone())
+        .with_max_audio_bytes(spec.max_wav_bytes);
+    if let Some(language) = &spec.language {
+        config = config.with_language(language.clone());
+    }
+    if let Some(threads) = spec.threads {
+        config = config.with_threads(threads);
+    }
+    if spec.sandbox_required {
+        config = config.with_sandbox(spec.sandbox_executable.clone().map(PathBuf::from));
+    }
+    Ok(config)
+}
+
 fn model_definition_to_config(
     definition: &TrustedLocalModelDefinition,
 ) -> Result<LocalModelConfig, DaemonError> {
@@ -571,6 +762,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
                 | "token-file"
                 | "allowed-root"
                 | "local-model-definition"
+                | "local-stt-definition"
                 | "scope"
         ) {
             return Err(DaemonError::Config(format!("nieznany argument --{key}")));
@@ -601,6 +793,7 @@ pub fn parse_args(args: impl Iterator<Item = String>) -> Result<DaemonConfig, Da
             .cloned()
             .unwrap_or_else(|| DEFAULT_SCOPE.into()),
         local_model_definition: required("local-model-definition")?.into(),
+        local_stt_definition: required("local-stt-definition")?.into(),
     })
 }
 
@@ -623,6 +816,7 @@ mod tests {
             token_file: "token".into(),
             scope: "local".into(),
             local_model_definition: root.path().join("model.json"),
+            local_stt_definition: root.path().join("stt.json"),
         };
         assert!(config.validate().is_err());
     }
@@ -647,8 +841,26 @@ mod tests {
             token_file: root.path().join("token"),
             scope: "local".into(),
             local_model_definition: root.path().join("local-model.json"),
+            local_stt_definition: root.path().join("local-stt.json"),
         };
         assert!(load_local_model_definition(&config).is_err());
+    }
+
+    #[test]
+    fn missing_local_stt_definition_is_fail_closed() {
+        let root = tempdir().unwrap();
+        let config = DaemonConfig {
+            sqlite_path: root.path().join("state.sqlite"),
+            socket_path: root.path().join("run.sock"),
+            runtime_dir: root.path().to_path_buf(),
+            trusted_definitions_dir: root.path().to_path_buf(),
+            allowed_roots: vec![root.path().to_path_buf()],
+            token_file: root.path().join("token"),
+            scope: "local".into(),
+            local_model_definition: root.path().join("local-model.json"),
+            local_stt_definition: root.path().join("local-stt.json"),
+        };
+        assert!(load_local_stt_definition(&config).is_err());
     }
 
     #[tokio::test]
@@ -683,6 +895,27 @@ mod tests {
         let model_path = defs.join("local-model.json");
         fs::write(&model_path, serde_json::to_vec(&model_definition).unwrap()).unwrap();
         fs::set_permissions(&model_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let stt_spec = TrustedLocalSttSpec {
+            executable: test_executable.display().to_string(),
+            model: test_executable.display().to_string(),
+            language: Some("pl".into()),
+            threads: Some(1),
+            timeout_ms: 1000,
+            max_wav_bytes: 1024,
+            working_dir: root.path().display().to_string(),
+            environment: BTreeMap::new(),
+            sandbox_required: false,
+            sandbox_executable: None,
+            executable_sha256: hash_file(&test_executable).unwrap(),
+            model_sha256: hash_file(&test_executable).unwrap(),
+        };
+        let stt_definition = TrustedLocalSttDefinition {
+            config_sha256: hash_bytes(&serde_json::to_vec(&stt_spec).unwrap()),
+            spec: stt_spec,
+        };
+        let stt_path = defs.join("local-stt.json");
+        fs::write(&stt_path, serde_json::to_vec(&stt_definition).unwrap()).unwrap();
+        fs::set_permissions(&stt_path, fs::Permissions::from_mode(0o600)).unwrap();
         let token_path = root.path().join("token");
         let mut token = std::fs::OpenOptions::new()
             .create_new(true)
@@ -700,6 +933,7 @@ mod tests {
             token_file: token_path,
             scope: "local".into(),
             local_model_definition: model_path,
+            local_stt_definition: stt_path,
         })
         .await
         .unwrap();

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,7 +21,8 @@ use victor_skill_api::{SkillApi, SkillApiError};
 use victor_skill_forge::ForgeRequest;
 use victor_skills::{SkillId, SkillManifest};
 
-pub const DEFAULT_MAX_REQUEST_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_MAX_AUDIO_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +33,11 @@ pub enum SkillOperation {
         input: String,
         at_unix_ms: u64,
         approval: Option<Approval>,
+    },
+    Voice {
+        conversation_id: String,
+        audio: Vec<u8>,
+        at_unix_ms: u64,
     },
     List,
     Review {
@@ -132,6 +139,17 @@ pub struct SkillResponse {
     pub error: Option<String>,
 }
 
+#[async_trait]
+pub trait VoiceService: Send + Sync {
+    async fn transcribe_and_chat(
+        &self,
+        conversation_id: String,
+        scope: String,
+        audio: Vec<u8>,
+        at_unix_ms: u64,
+    ) -> Result<Value, String>;
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {
     #[error("transport nie jest skonfigurowany: {0}")]
@@ -150,9 +168,11 @@ struct ServerState {
     api: SkillApi,
     plugin_api: Option<Arc<Mutex<PluginLifecycleApi>>>,
     conversation: Option<Arc<dyn ConversationService>>,
+    voice: Option<Arc<dyn VoiceService>>,
     token: String,
     scope: String,
     max_request_bytes: usize,
+    max_audio_bytes: usize,
     idempotent: HashMap<String, CachedResponse>,
 }
 
@@ -190,9 +210,11 @@ impl UnixSkillServer {
                 api,
                 plugin_api: None,
                 conversation: None,
+                voice: None,
                 token,
                 scope,
                 max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+                max_audio_bytes: DEFAULT_MAX_AUDIO_BYTES,
                 idempotent: HashMap::new(),
             })),
             request_timeout: DEFAULT_TIMEOUT,
@@ -217,6 +239,13 @@ impl UnixSkillServer {
         self
     }
 
+    pub fn with_voice(self, service: Arc<dyn VoiceService>) -> Self {
+        if let Ok(mut guard) = self.state.try_lock() {
+            guard.voice = Some(service);
+        }
+        self
+    }
+
     pub fn with_limits(
         mut self,
         max_request_bytes: usize,
@@ -237,6 +266,19 @@ impl UnixSkillServer {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    pub fn with_audio_limit(self, max_audio_bytes: usize) -> Result<Self, TransportError> {
+        if max_audio_bytes == 0 {
+            return Err(TransportError::InvalidConfig(
+                "limit audio musi być większy od zera".into(),
+            ));
+        }
+        self.state
+            .try_lock()
+            .map_err(|_| TransportError::InvalidConfig("blokada stanu".into()))?
+            .max_audio_bytes = max_audio_bytes;
+        Ok(self)
     }
 
     pub async fn run(self, mut shutdown: oneshot::Receiver<()>) -> Result<(), TransportError> {
@@ -424,6 +466,27 @@ async fn dispatch(request: SkillRequest, state: &Arc<Mutex<ServerState>>) -> Ski
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|value| serde_json::to_value(value).map_err(|error| error.to_string()))
+        }
+        SkillOperation::Voice {
+            conversation_id,
+            audio,
+            at_unix_ms,
+        } => {
+            if audio.is_empty() {
+                return failure("audio nie może być puste");
+            }
+            if audio.len() > guard.max_audio_bytes {
+                return failure(format!(
+                    "audio przekracza limit {} bajtów",
+                    guard.max_audio_bytes
+                ));
+            }
+            let Some(service) = guard.voice.as_ref().cloned() else {
+                return failure("voice API nie jest skonfigurowane");
+            };
+            service
+                .transcribe_and_chat(conversation_id, request.scope.clone(), audio, at_unix_ms)
+                .await
         }
         SkillOperation::List => {
             serde_json::to_value(guard.api.list()).map_err(|error| error.to_string())

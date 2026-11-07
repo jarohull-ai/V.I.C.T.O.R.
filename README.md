@@ -156,7 +156,11 @@ cargo fmt --all --check
 16. **`Transcript` niesie provenance.** `provider` i `location` (`Local`/`Cloud`)
     idą do `ContextItem` przez `ContextSource::local_stt` / `cloud_stt`, więc
     pamięć odróżnia transkrypcję lokalną od chmurowej bez zaglądania w logi.
-17. **Chmura to osobny crate i opt-in.** `victor-stt-cloud` ma `default = []`;
+17. **Daemon udostępnia lokalny głos przez `voice`.** Trusted `local-stt.json`
+    określa binarkę whisper.cpp, model, limity, środowisko i sandbox; klient
+    wysyła tylko audio oraz conversation ID. Audio nie trafia do SQLite, a
+    transcript przechodzi przez runtime, rozmowę, policy i narzędzia.
+18. **Chmura to osobny crate i opt-in.** `victor-stt-cloud` ma `default = []`;
     dopiero `--features openai` albo `--features deepgram` wciąga klienta HTTP.
     `victor-integrations` i lokalna ścieżka whisper.cpp nie wiedzą o istnieniu
     chmury, a `victor-stt-cloud` nie zna whispera.

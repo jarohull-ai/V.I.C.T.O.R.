@@ -11,6 +11,7 @@
 //! - brak modelu albo błędu binarki = błąd, nigdy fallback do chmury;
 //! - wynik jest oznaczony jako `TranscriptionLocation::Local`.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -37,6 +38,11 @@ pub struct WhisperCppConfig {
     pub language: Option<String>,
     pub threads: Option<u16>,
     pub timeout: Duration,
+    pub working_dir: Option<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+    pub max_audio_bytes: usize,
+    pub sandbox_required: bool,
+    pub sandbox_executable: Option<PathBuf>,
 }
 
 impl WhisperCppConfig {
@@ -47,6 +53,11 @@ impl WhisperCppConfig {
             language: None,
             threads: None,
             timeout: DEFAULT_WHISPER_TIMEOUT,
+            working_dir: None,
+            environment: BTreeMap::new(),
+            max_audio_bytes: 4 * 1024 * 1024,
+            sandbox_required: false,
+            sandbox_executable: None,
         }
     }
 
@@ -65,6 +76,27 @@ impl WhisperCppConfig {
         self
     }
 
+    pub fn with_working_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.working_dir = Some(path.into());
+        self
+    }
+
+    pub fn with_environment(mut self, environment: BTreeMap<String, String>) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    pub fn with_max_audio_bytes(mut self, limit: usize) -> Self {
+        self.max_audio_bytes = limit;
+        self
+    }
+
+    pub fn with_sandbox(mut self, executable: Option<PathBuf>) -> Self {
+        self.sandbox_required = true;
+        self.sandbox_executable = executable;
+        self
+    }
+
     /// Fail-closed: brak binarki albo modelu oznacza, że nie ma czym
     /// transkrybować. Nie próbujemy wtedy żadnego innego dostawcy.
     pub fn validate(&self) -> Result<(), IntegrationError> {
@@ -73,6 +105,11 @@ impl WhisperCppConfig {
         if self.timeout.is_zero() {
             return Err(IntegrationError::NotConfigured(
                 "timeout whisper.cpp nie może być zerowy".into(),
+            ));
+        }
+        if self.max_audio_bytes == 0 {
+            return Err(IntegrationError::NotConfigured(
+                "limit WAV whisper.cpp nie może być zerowy".into(),
             ));
         }
         if matches!(self.threads, Some(0)) {
@@ -122,6 +159,10 @@ pub struct WhisperInvocation {
     pub language: Option<String>,
     pub threads: Option<u16>,
     pub timeout: Duration,
+    pub working_dir: Option<PathBuf>,
+    pub environment: BTreeMap<String, String>,
+    pub sandbox_required: bool,
+    pub sandbox_executable: Option<PathBuf>,
 }
 
 /// Jedyny sposób, w jaki adapter dotyka świata zewnętrznego. Podmiana runnera
@@ -152,7 +193,33 @@ impl WhisperRunner for ProcessWhisperRunner {
         tokio::fs::write(&audio_path, &invocation.audio_wav).await?;
         let output_prefix = working_dir.path().join("transcript");
 
-        let mut command = tokio::process::Command::new(&invocation.program);
+        let mut command = if invocation.sandbox_required {
+            let sandbox = invocation.sandbox_executable.clone().ok_or_else(|| {
+                IntegrationError::NotConfigured("brak executable sandboxa".into())
+            })?;
+            let mut wrapped = tokio::process::Command::new(sandbox);
+            wrapped.args([
+                "--die-with-parent",
+                "--new-session",
+                "--clearenv",
+                "--unshare-net",
+                "--ro-bind",
+                "/",
+                "/",
+                "--tmpfs",
+                "/tmp",
+                "--",
+            ]);
+            wrapped.arg(&invocation.program);
+            wrapped
+        } else {
+            tokio::process::Command::new(&invocation.program)
+        };
+        if !invocation.sandbox_required {
+            command.env_clear().envs(&invocation.environment);
+        } else {
+            command.env_clear();
+        }
         command
             .arg("-m")
             .arg(&invocation.model)
@@ -166,6 +233,9 @@ impl WhisperRunner for ProcessWhisperRunner {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(dir) = &invocation.working_dir {
+            command.current_dir(dir);
+        }
 
         if let Some(language) = invocation.language.as_deref() {
             command.arg("-l").arg(language);
@@ -263,7 +333,7 @@ impl<R: WhisperRunner> SpeechToText for WhisperCppSpeechToText<R> {
         let audio = request.audio;
         // `request.authorization` jest świadomie ignorowane: to ścieżka lokalna,
         // nic nie opuszcza komputera, więc zgoda chmurowa nie jest potrzebna.
-        validate_local_audio(&audio)?;
+        validate_local_audio(&audio, self.config.max_audio_bytes)?;
 
         let raw = self
             .runner
@@ -274,6 +344,10 @@ impl<R: WhisperRunner> SpeechToText for WhisperCppSpeechToText<R> {
                 language: self.config.language.clone(),
                 threads: self.config.threads,
                 timeout: self.config.timeout,
+                working_dir: self.config.working_dir.clone(),
+                environment: self.config.environment.clone(),
+                sandbox_required: self.config.sandbox_required,
+                sandbox_executable: self.config.sandbox_executable.clone(),
             })
             .await?;
 
@@ -281,8 +355,17 @@ impl<R: WhisperRunner> SpeechToText for WhisperCppSpeechToText<R> {
     }
 }
 
-fn validate_local_audio(audio: &AudioChunk) -> Result<(), IntegrationError> {
+fn validate_local_audio(
+    audio: &AudioChunk,
+    max_audio_bytes: usize,
+) -> Result<(), IntegrationError> {
     audio.validate()?;
+    if audio.bytes.len() > max_audio_bytes {
+        return Err(IntegrationError::Denied(format!(
+            "nagranie przekracza limit {} bajtów",
+            max_audio_bytes
+        )));
+    }
     if audio.format != AudioFormat::Wav {
         return Err(IntegrationError::Denied(format!(
             "whisper.cpp przyjmuje tylko WAV, otrzymano {}; konwersja nie jest wykonywana po cichu",
@@ -294,6 +377,11 @@ fn validate_local_audio(audio: &AudioChunk) -> Result<(), IntegrationError> {
             "whisper.cpp wymaga {} Hz mono, otrzymano {} Hz / {} kanał(y); konwersja nie jest wykonywana po cichu",
             WHISPER_SAMPLE_RATE_HZ, audio.sample_rate_hz, audio.channels
         )));
+    }
+    if audio.bytes.len() < 12 || &audio.bytes[0..4] != b"RIFF" || &audio.bytes[8..12] != b"WAVE" {
+        return Err(IntegrationError::Denied(
+            "nagranie nie ma poprawnego nagłówka RIFF/WAVE".into(),
+        ));
     }
     Ok(())
 }
@@ -415,8 +503,11 @@ mod tests {
     }
 
     fn wav() -> AudioChunk {
+        let mut bytes = vec![0; 64];
+        bytes[0..4].copy_from_slice(b"RIFF");
+        bytes[8..12].copy_from_slice(b"WAVE");
         AudioChunk {
-            bytes: vec![0; 64],
+            bytes,
             format: AudioFormat::Wav,
             sample_rate_hz: 16_000,
             channels: 1,
