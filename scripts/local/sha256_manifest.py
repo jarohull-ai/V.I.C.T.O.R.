@@ -40,7 +40,11 @@ def digest(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def display_name(path: Path, base: Path) -> str:
+def display_name(path: Path, base: Path, cwd: Path) -> str:
+    try:
+        return path.relative_to(cwd).as_posix()
+    except ValueError:
+        pass
     try:
         return path.relative_to(base).as_posix()
     except ValueError:
@@ -83,8 +87,9 @@ def main() -> None:
     if output in artifacts:
         fail("manifest output cannot also be an artifact")
     base = Path(os.path.commonpath([str(path.parent) for path in artifacts]))
+    cwd = Path.cwd().resolve()
     rows = sorted(
-        (f"{digest(path)}  {display_name(path, base)}" for path in artifacts),
+        (f"{digest(path)}  {display_name(path, base, cwd)}" for path in artifacts),
         key=lambda row: row.rsplit("  ", 1)[1],
     )
     write_manifest(output, "\n".join(rows) + "\n")
