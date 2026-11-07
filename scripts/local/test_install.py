@@ -11,6 +11,7 @@ import tempfile
 from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("install.py")
+HASH_SCRIPT = Path(__file__).with_name("sha256_manifest.py")
 
 
 def run(*args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -88,4 +89,31 @@ with tempfile.TemporaryDirectory() as temporary:
     linked_release = root / "linked-release"
     linked_release.symlink_to(release, target_is_directory=True)
     run_fail("install", "--release-dir", str(linked_release), env=env)
+
+    first = root / "artifact-a"
+    second = root / "artifact-b"
+    first.write_bytes(b"a")
+    second.write_bytes(b"b")
+    manifest = root / "SHA256SUMS"
+    result = subprocess.run(
+        [sys.executable, str(HASH_SCRIPT), "--output", str(manifest), str(second), str(first)],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert "2 artifacts" in result.stdout
+    rows = manifest.read_text().splitlines()
+    assert rows == sorted(rows, key=lambda row: row.rsplit("  ", 1)[1])
+    assert rows[0].startswith("ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb  ")
+    linked_artifact = root / "linked-artifact"
+    linked_artifact.symlink_to(first)
+    run_fail_hash = subprocess.run(
+        [sys.executable, str(HASH_SCRIPT), "--output", str(root / "bad"), str(linked_artifact)],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert run_fail_hash.returncode != 0
     print("local installer tests: ok")

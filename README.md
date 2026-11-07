@@ -120,6 +120,8 @@ Po zbudowaniu release można użyć instalatora użytkownika. Wymaga on
 cargo build --release --workspace --all-features --locked
 python3 scripts/local/install.py install --release-dir target/release
 python3 scripts/local/test_install.py
+python3 scripts/local/sha256_manifest.py --output target/release/SHA256SUMS \
+  target/release/victor-daemon target/release/victor-skill
 ```
 
 Trusted definitions są tworzone jako placeholdery i muszą zostać ręcznie

@@ -12,6 +12,8 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo fmt --all --check
 git diff --check
 python3 scripts/local/test_install.py
+python3 scripts/local/sha256_manifest.py --output target/release/SHA256SUMS \
+  target/release/victor-daemon target/release/victor-skill
 sha256sum target/release/victor-daemon target/release/victor-skill
 ```
 
@@ -78,3 +80,7 @@ operatora; instalator ich nie pobiera i nie uruchamia.
 - [ ] binaria i konfiguracje release mają opublikowane SHA-256;
 - [ ] smoke test voice przechodzi na fixture bez sieci;
 - [ ] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
+
+Manifest sum jest deterministyczny, sortowany po nazwie artefaktu i odrzuca
+symlinki. Generuj go dopiero po zakończeniu builda release; nie umieszczaj w nim
+tokenów, trusted definitions ani plików konfiguracyjnych zawierających sekrety.
