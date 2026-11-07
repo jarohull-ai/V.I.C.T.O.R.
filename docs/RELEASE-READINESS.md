@@ -1,5 +1,9 @@
 # V.I.C.T.O.R. — release readiness
 
+Aktualny kandydat: `v0.1.0-rc.2` na commitcie
+`86dc4d06c0df9b35cf4476f65d17bf1d11c835fa`. Istniejący `v0.1.0-rc.1` wskazuje
+bez zmian `cd4a326ddeba8cba5fbb51192be3f89575620ced`.
+
 ## Clean checkout gate
 
 Uruchamiane z katalogu repozytorium, bez zależności od innych checkoutów:
@@ -80,6 +84,16 @@ operatora; instalator ich nie pobiera i nie uruchamia.
 - [ ] binaria i konfiguracje release mają opublikowane SHA-256;
 - [ ] smoke test voice przechodzi na fixture bez sieci;
 - [x] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
+
+## RC.2 tag command
+
+Po akceptacji właściciela, bez force push:
+
+```sh
+git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
+```
+
+Nie tworzyć taga ani GitHub Release automatycznie.
 
 Manifest sum jest deterministyczny, sortowany po nazwie artefaktu i odrzuca
 symlinki. Generuj go dopiero po zakończeniu builda release; nie umieszczaj w nim
