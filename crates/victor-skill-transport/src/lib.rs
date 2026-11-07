@@ -295,8 +295,10 @@ impl UnixSkillServer {
             }
             remove_owned_socket(&self.socket_path)?;
         }
-        let listener = UnixListener::bind(&self.socket_path)?;
-        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
+        let listener = UnixListener::bind(&self.socket_path)
+            .map_err(|error| TransportError::InvalidConfig(format!("bind socketu: {error}")))?;
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| TransportError::InvalidConfig(format!("chmod socketu: {error}")))?;
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
