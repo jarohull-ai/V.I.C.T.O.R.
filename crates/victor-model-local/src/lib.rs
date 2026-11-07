@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -96,7 +96,10 @@ impl LocalModelConfig {
             ));
         }
         if self.sandbox_required {
-            let sandbox = self.sandbox_executable.clone().or_else(|| find_in_path("bwrap"));
+            let sandbox = self
+                .sandbox_executable
+                .clone()
+                .or_else(|| find_in_path("bwrap"));
             if sandbox.as_ref().is_none_or(|path| !path.is_file()) {
                 return Err(LocalModelError::SandboxUnavailable);
             }
@@ -115,7 +118,11 @@ struct ModelRequest<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct ContextPayload { rendered: String, total_bytes: u64, dropped_items: usize }
+struct ContextPayload {
+    rendered: String,
+    total_bytes: u64,
+    dropped_items: usize,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,9 +156,44 @@ struct ModelProcess {
 impl ModelProcess {
     async fn spawn(config: &LocalModelConfig) -> Result<Self, LocalModelError> {
         config.validate()?;
-        let mut command = Command::new(&config.command[0]);
-        command.args(&config.command[1..]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-        command.env_clear().envs(&config.environment).current_dir(&config.working_dir);
+        let mut command = if config.sandbox_required {
+            let sandbox = config
+                .sandbox_executable
+                .clone()
+                .or_else(|| find_in_path("bwrap"))
+                .ok_or(LocalModelError::SandboxUnavailable)?;
+            let mut wrapped = Command::new(sandbox);
+            wrapped
+                .args([
+                    "--die-with-parent",
+                    "--new-session",
+                    "--clearenv",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--tmpfs",
+                    "/tmp",
+                    "--",
+                ])
+                .arg(&config.command[0])
+                .args(&config.command[1..]);
+            wrapped
+        } else {
+            Command::new(&config.command[0])
+        };
+        if !config.sandbox_required {
+            command.args(&config.command[1..]);
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        command
+            .env_clear()
+            .envs(&config.environment)
+            .current_dir(&config.working_dir);
         let mut child = command
             .spawn()
             .map_err(|e| LocalModelError::Spawn(e.to_string()))?;
@@ -163,7 +205,10 @@ impl ModelProcess {
             .stdout
             .take()
             .ok_or_else(|| LocalModelError::Spawn("brak stdout".into()))?;
-        let stderr = child.stderr.take().ok_or_else(|| LocalModelError::Spawn("brak stderr".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| LocalModelError::Spawn("brak stderr".into()))?;
         let stderr_exceeded = Arc::new(AtomicBool::new(false));
         let exceeded = stderr_exceeded.clone();
         let limit = config.max_stderr_bytes;
@@ -302,6 +347,7 @@ impl LocalModel {
     async fn respond_once(
         &self,
         history: &[ConversationTurn],
+        context: &ContextView,
         input: &str,
     ) -> Result<ModelResult, LocalModelError> {
         let mut guard = self.process.lock().await;
@@ -313,13 +359,28 @@ impl LocalModel {
             protocol_version: PROTOCOL_VERSION,
             input,
             history,
+            context: ContextPayload {
+                rendered: context.render_plain(),
+                total_bytes: context.total_bytes,
+                dropped_items: context.dropped_items,
+            },
         })
         .map_err(|e| LocalModelError::InvalidJson(e.to_string()))?;
         process.send(&request, self.config.timeout).await?;
-        match serde_json::from_value(process.receive(self.config.timeout).await?)
-            .map_err(|e| LocalModelError::InvalidJson(e.to_string()))?
-        {
-            ModelResponse::Reply { text } => Ok(ModelResult::Reply(text)),
+        let response = serde_json::from_value(process.receive(self.config.timeout).await?)
+            .map_err(|e| LocalModelError::InvalidJson(e.to_string()))?;
+        if process.stderr_exceeded.load(Ordering::Acquire) {
+            return Err(LocalModelError::StderrTooLarge);
+        }
+        match response {
+            ModelResponse::Reply { text } => {
+                if text.is_empty() || text.len() > MAX_TEXT_BYTES {
+                    return Err(LocalModelError::InvalidJson(
+                        "reply ma nieprawidłowy rozmiar".into(),
+                    ));
+                }
+                Ok(ModelResult::Reply(text))
+            }
             ModelResponse::PlanRequest {
                 tool,
                 description,
@@ -327,7 +388,14 @@ impl LocalModel {
             } => Ok(ModelResult::PlanRequest {
                 tool: ToolId::parse(&tool)
                     .map_err(|e| LocalModelError::InvalidTool(e.to_string()))?,
-                description,
+                description: {
+                    if description.is_empty() || description.len() > MAX_TEXT_BYTES {
+                        return Err(LocalModelError::InvalidJson(
+                            "description ma nieprawidłowy rozmiar".into(),
+                        ));
+                    }
+                    description
+                },
                 args,
             }),
         }
@@ -341,9 +409,23 @@ impl ConversationModel for LocalModel {
         history: &[ConversationTurn],
         input: &str,
     ) -> Result<ModelResult, String> {
+        let empty = ContextView {
+            items: Vec::new(),
+            total_bytes: 0,
+            dropped_items: 0,
+        };
+        self.respond_with_context(history, &empty, input).await
+    }
+
+    async fn respond_with_context(
+        &self,
+        history: &[ConversationTurn],
+        context: &ContextView,
+        input: &str,
+    ) -> Result<ModelResult, String> {
         let mut attempts = 0;
         loop {
-            match self.respond_once(history, input).await {
+            match self.respond_once(history, context, input).await {
                 Ok(result) => return Ok(result),
                 Err(_error) if attempts < self.config.max_restart_attempts => {
                     attempts += 1;
@@ -364,4 +446,12 @@ impl ConversationModel for LocalModel {
             }
         }
     }
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
