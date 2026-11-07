@@ -50,7 +50,7 @@ def main() -> None:
         spec = {
             "command": [str(executable)],
             "working_dir": str(work),
-            "environment": {"SECRET_TOKEN": "C"},
+            "environment": {"LANG": "C"},
             "timeout_ms": 1000,
             "max_frame_bytes": 4096,
             "max_stderr_bytes": 1024,
@@ -59,17 +59,27 @@ def main() -> None:
             "sandbox_executable": None,
             "executable_sha256": digest(executable),
         }
+        spec_hash = "sha256:" + hashlib.sha256(
+            json.dumps(spec, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
         (trusted / "local-model.json").write_text(
-            json.dumps({"config_sha256": "sha256:" + "0" * 64, "spec": spec}), encoding="utf-8"
+            json.dumps({"config_sha256": spec_hash, "spec": spec}), encoding="utf-8"
         )
         (trusted / "local-model.json").chmod(0o600)
         result = run("validate", "--directory", str(trusted))
-        assert result.returncode == 1, result.stdout + result.stderr
-        assert "Invalid" in result.stdout
+        assert result.returncode == 0, result.stdout + result.stderr
         report = json.loads(result.stdout)
-        assert report["failures"]
-        assert '"SECRET_TOKEN"' not in result.stdout
-        assert '"C"' not in result.stdout
+        assert report["definitions"]
+        assert report["definitions"][0]["environment_keys"] == ["LANG"]
+        assert '"environment":' not in result.stdout
+
+        # A changed definition hash must be rejected before daemon startup.
+        document = json.loads((trusted / "local-model.json").read_text(encoding="utf-8"))
+        document["config_sha256"] = "sha256:" + "0" * 64
+        (trusted / "local-model.json").write_text(json.dumps(document), encoding="utf-8")
+        (trusted / "local-model.json").chmod(0o600)
+        changed = run("validate", "--directory", str(trusted))
+        assert changed.returncode == 1 and "config_sha256" in changed.stdout
 
         missing = run("validate", "--directory", str(base / "missing"))
         assert missing.returncode == 2 and "NotConfigured" in missing.stdout
