@@ -1,7 +1,7 @@
 //! Lokalny transport API skills przez Unix domain socket.
 
 use std::collections::HashMap;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -226,18 +226,28 @@ impl UnixSkillServer {
                     "ścieżka socketu wskazuje istniejący plik nie będący Unix socketem".into(),
                 ));
             }
-            std::fs::remove_file(&self.socket_path)?;
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(TransportError::InvalidConfig(
+                    "socket należy do innego użytkownika".into(),
+                ));
+            }
+            remove_owned_socket(&self.socket_path)?;
         }
         let listener = UnixListener::bind(&self.socket_path)?;
         std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600))?;
         loop {
             tokio::select! {
                 _ = &mut shutdown => {
-                    let _ = std::fs::remove_file(&self.socket_path);
+                    let _ = remove_owned_socket(&self.socket_path);
                     return Ok(());
                 }
                 accepted = listener.accept() => {
                     let (stream, _) = accepted?;
+                    if let Ok(cred) = stream.peer_cred() {
+                        if cred.uid() != unsafe { libc::geteuid() } {
+                            continue;
+                        }
+                    }
                     let state = self.state.clone();
                     let request_timeout = self.request_timeout;
                     tokio::spawn(async move { let _ = handle_connection(stream, state, request_timeout).await; });
@@ -245,6 +255,21 @@ impl UnixSkillServer {
             }
         }
     }
+}
+
+fn remove_owned_socket(path: &Path) -> Result<(), TransportError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(TransportError::Io)?;
+    if !metadata.file_type().is_socket() {
+        return Err(TransportError::InvalidConfig(
+            "odmowa usunięcia ścieżki nie będącej socketem".into(),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(TransportError::InvalidConfig(
+            "odmowa usunięcia socketu obcego właściciela".into(),
+        ));
+    }
+    std::fs::remove_file(path).map_err(TransportError::Io)
 }
 
 async fn handle_connection(

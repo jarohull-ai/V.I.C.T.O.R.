@@ -1,0 +1,22 @@
+[package]
+name = "victor-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+victor-domain = { path = "../victor-domain" }
+victor-plugin-host = { path = "../victor-plugin-host" }
+victor-policy = { path = "../victor-policy" }
+victor-skill-api = { path = "../victor-skill-api" }
+victor-skill-transport = { path = "../victor-skill-transport" }
+victor-storage = { path = "../victor-storage" }
+victor-tools = { path = "../victor-tools" }
+
+[dev-dependencies]
+tempfile.workspace = true

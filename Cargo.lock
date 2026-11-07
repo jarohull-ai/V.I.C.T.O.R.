@@ -1870,6 +1870,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "victor-daemon"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "victor-domain",
+ "victor-plugin-host",
+ "victor-policy",
+ "victor-skill-api",
+ "victor-skill-transport",
+ "victor-storage",
+ "victor-tools",
+]
+
+[[package]]
 name = "victor-domain"
 version = "0.1.0"
 dependencies = [
@@ -2018,6 +2037,7 @@ dependencies = [
 name = "victor-skill-transport"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -17,6 +17,7 @@ members = [
     "crates/victor-runtime",
     "crates/victor-plugin-contract",
     "crates/victor-plugin-host",
+    "crates/victor-daemon",
 ]
 
 [workspace.package]
@@ -32,6 +33,7 @@ thiserror = "2"
 sha2 = "0.10"
 async-trait = "0.1"
 tempfile = "3"
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time", "sync", "signal"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
 url = "2"

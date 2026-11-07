@@ -617,18 +617,37 @@ impl PersistentPluginHost {
         self.record_lifecycle(id, AuditOutcome::Succeeded, "disable")
     }
 
+    fn record_for(&self, id: &ToolId) -> Result<PluginRegistrationRecord, HostError> {
+        self.store
+            .plugin_registrations()
+            .map_err(storage_host_error)?
+            .into_iter()
+            .find(|record| record.plugin_id == id.as_str())
+            .ok_or_else(|| HostError::NotRegistered(id.to_string()))
+    }
+
     pub async fn activate(
         &mut self,
         id: &ToolId,
         registry: &mut victor_tools::ToolRegistry,
     ) -> Result<Arc<PluginToolExecutor>, HostError> {
-        let record = self
-            .store
-            .plugin_registrations()
-            .map_err(storage_host_error)?
-            .into_iter()
-            .find(|record| record.plugin_id == id.as_str())
-            .ok_or_else(|| HostError::NotRegistered(id.to_string()))?;
+        let executor = self.activate_registered(id).await?;
+        let record = self.record_for(id)?;
+        let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
+            .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        if registry.get(id).is_none() {
+            registry
+                .register(manifest)
+                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
+        }
+        Ok(executor)
+    }
+
+    async fn activate_registered(
+        &mut self,
+        id: &ToolId,
+    ) -> Result<Arc<PluginToolExecutor>, HostError> {
+        let record = self.record_for(id)?;
         if record.status == "active" {
             if let Some(executor) = self.host.get(id) {
                 return Ok(executor);
@@ -647,11 +666,6 @@ impl PersistentPluginHost {
                 self.audit.clone(),
             )
             .await?;
-        if registry.get(id).is_none() {
-            registry
-                .register(manifest)
-                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
-        }
         self.store
             .set_plugin_status(id.as_str(), "active")
             .map_err(storage_host_error)?;
@@ -697,7 +711,6 @@ impl PersistentPluginHost {
 /// interfejs; registry, policy, SQLite i executory pozostają po stronie hosta.
 pub struct PluginLifecycleApi {
     host: PersistentPluginHost,
-    registry: victor_tools::ToolRegistry,
     policy: Arc<PolicyEngine>,
     store: Arc<SqliteContextStore>,
     catalog: BTreeMap<String, (ToolManifest, Vec<String>, PluginLaunchPolicy)>,
@@ -720,17 +733,8 @@ impl PluginLifecycleApi {
             check_manifest_policy(&policy, &manifest, None, 0)?;
         }
         let host = PersistentPluginHost::open(store.clone(), audit).await?;
-        let mut registry = victor_tools::ToolRegistry::new();
-        for record in store.plugin_registrations().map_err(storage_host_error)? {
-            let manifest: ToolManifest = serde_json::from_str(&record.manifest_json)
-                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
-            registry
-                .register(manifest)
-                .map_err(|error| HostError::ManifestMismatch(error.to_string()))?;
-        }
         Ok(Self {
             host,
-            registry,
             policy,
             store,
             catalog: BTreeMap::new(),
@@ -832,9 +836,7 @@ impl PluginLifecycleApi {
         self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
         let id = manifest.descriptor.id.clone();
         let policy = launch.policy()?;
-        self.host
-            .register_into_registry(launch.command, manifest, policy, &mut self.registry)
-            .await?;
+        self.host.register(launch.command, manifest, policy).await?;
         self.record_decision(&id, "register", "active", actor, reason, at_unix_ms)?;
         self.summary(&id)
     }
@@ -849,7 +851,7 @@ impl PluginLifecycleApi {
     ) -> Result<PluginSummary, HostError> {
         let manifest = self.manifest(id)?;
         self.check_policy(&manifest, approval.as_ref(), at_unix_ms)?;
-        self.host.activate(id, &mut self.registry).await?;
+        self.host.activate_registered(id).await?;
         self.record_decision(id, "activate", "active", actor, reason, at_unix_ms)?;
         self.summary(id)
     }
