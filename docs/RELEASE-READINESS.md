@@ -86,16 +86,16 @@ operatora; instalator ich nie pobiera i nie uruchamia.
 - [ ] smoke test voice przechodzi na fixture bez sieci;
 - [x] trwała ochrona idempotency po restarcie jest zamknięta przed RC.
 
-## RC.2 tag command
+## RC.2 tag verification
 
-Po akceptacji właściciela, bez force push:
+Tag został już utworzony poza tym zadaniem i nie wolno go zmieniać:
 
 ```sh
-git tag -a v0.1.0-rc.2 -m "V.I.C.T.O.R. v0.1.0-rc.2" 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
-git push origin v0.1.0-rc.2
+git rev-parse refs/tags/v0.1.0-rc.2^{commit}
+# 86dc4d06c0df9b35cf4476f65d17bf1d11c835fa
 ```
 
-Nie tworzyć taga ani GitHub Release automatycznie.
+Nie tworzyć taga ponownie ani nie publikować GitHub Release automatycznie.
 
 Manifest sum jest deterministyczny, sortowany po nazwie artefaktu i odrzuca
 symlinki. Generuj go dopiero po zakończeniu builda release; nie umieszczaj w nim
