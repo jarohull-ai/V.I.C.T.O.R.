@@ -39,6 +39,9 @@ użycia produkcyjnego znajdują się w pliku [`LICENSE`](LICENSE) oraz w
 Katalog `vendor/bse-fetch` jest odrębnym wyjątkiem licencyjnym: pozostaje na
 licencji MIT i zachowuje własne pliki `LICENSE` oraz `ORIGIN.md`.
 
+Publiczny gate CI dla `main` uruchamia kontrolę granic repozytorium, licencji,
+formatowania, testów, Clippy i białych znaków dla każdego push oraz pull request.
+
 ## Granica pluginów
 
 Zewnętrzne narzędzia działają jako ograniczone procesy potomne przez

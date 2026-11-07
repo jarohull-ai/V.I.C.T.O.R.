@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify workspace
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check repository boundaries and licenses
+        run: python3 scripts/ci/check_repo.py
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check tests
+        run: cargo test --workspace --all-features --locked
+
+      - name: Check Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Check diff
+        run: git diff --check
